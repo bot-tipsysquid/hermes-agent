@@ -4859,6 +4859,24 @@ def _run_npm_install_deterministic(
     self-reinforcing cycle where web devDeps never install and a stale dist
     is served on every update (PR #65595).
     """
+    return _run_npm_install_deterministic_with_prefix(
+        [npm],
+        cwd,
+        extra_args=extra_args,
+        capture_output=capture_output,
+        env=env,
+    )
+
+
+def _run_npm_install_deterministic_with_prefix(
+    npm_prefix: list[str],
+    cwd: Path,
+    *,
+    extra_args: tuple[str, ...] = (),
+    capture_output: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run npm ci/install using ``npm_prefix`` as the executable + wrapper."""
     # unicode-animations' postinstall animates to /dev/tty (bypasses
     # --silent/capture_output). It no-ops when CI is set — same as the TUI
     # install path and nix/lib.nix npm ci hooks.
@@ -4866,7 +4884,7 @@ def _run_npm_install_deterministic(
 
     lockfile = cwd / "package-lock.json"
     if lockfile.exists():
-        ci_cmd = [npm, "ci", "--include=dev", *extra_args]
+        ci_cmd = [*npm_prefix, "ci", "--include=dev", *extra_args]
         ci_result = subprocess.run(
             ci_cmd,
             cwd=cwd,
@@ -4881,7 +4899,7 @@ def _run_npm_install_deterministic(
             return ci_result
         # Fall through to `npm install` — lockfile may be out of sync on a
         # WIP fork/branch, or `npm ci` may not be available on very old npm.
-    install_cmd = [npm, "install", "--no-save", "--include=dev", *extra_args]
+    install_cmd = [*npm_prefix, "install", "--no-save", "--include=dev", *extra_args]
     return subprocess.run(
         install_cmd,
         cwd=cwd,
@@ -4892,6 +4910,134 @@ def _run_npm_install_deterministic(
         errors="replace",
         check=False,
     )
+
+
+def _fedora_silverblue_without_host_make() -> bool:
+    """Return True for Fedora Silverblue/ostree hosts that lack make."""
+    if sys.platform != "linux" or shutil.which("make"):
+        return False
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return (
+        "ID=fedora" in os_release
+        and (
+            "VARIANT_ID=silverblue" in os_release
+            or "OSTREE_VERSION=" in os_release
+            or "Silverblue" in os_release
+        )
+    )
+
+
+def _desktop_toolbox_build_container() -> str | None:
+    """Find a toolbox that can build native npm addons for Desktop.
+
+    Fedora Silverblue commonly keeps compilers out of the immutable host.  On
+    aarch64, node-pty has no linux-arm64 prebuild, so ``npm ci`` must run where
+    ``make``/``gcc``/``g++`` are available.  Prefer the Hermes migration toolbox
+    when present and otherwise use any toolbox with the required toolchain.
+    """
+    if not _fedora_silverblue_without_host_make():
+        return None
+    toolbox = shutil.which("toolbox")
+    if not toolbox:
+        return None
+
+    try:
+        listed = subprocess.run(
+            [toolbox, "list", "--containers"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listed.returncode != 0:
+        return None
+
+    names: list[str] = []
+    for line in listed.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("CONTAINER "):
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2:
+            names.append(parts[1])
+
+    candidates = ["hermes-arm-build", *names]
+    seen: set[str] = set()
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            probe = subprocess.run(
+                [
+                    toolbox,
+                    "run",
+                    "--container",
+                    name,
+                    "sh",
+                    "-lc",
+                    "command -v make >/dev/null && command -v gcc >/dev/null && "
+                    "command -v g++ >/dev/null && command -v npm >/dev/null",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return name
+    return None
+
+
+def _run_npm_install_deterministic_in_toolbox(
+    container: str,
+    cwd: Path,
+    *,
+    extra_args: tuple[str, ...] = (),
+    capture_output: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    toolbox = shutil.which("toolbox") or "toolbox"
+    return _run_npm_install_deterministic_with_prefix(
+        [toolbox, "run", "--container", container, "npm"],
+        cwd,
+        extra_args=extra_args,
+        capture_output=capture_output,
+        env=env,
+    )
+
+
+def _run_desktop_dependency_install(
+    npm: str,
+    cwd: Path,
+    *,
+    capture_output: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    container = _desktop_toolbox_build_container()
+    if container:
+        print(
+            "  → Host lacks native build tools; running Desktop npm install "
+            f"inside toolbox '{container}'"
+        )
+        return _run_npm_install_deterministic_in_toolbox(
+            container,
+            cwd,
+            capture_output=capture_output,
+            env=env,
+        )
+    return _run_npm_install_deterministic(npm, cwd, capture_output=capture_output, env=env)
 
 
 def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
@@ -5533,6 +5679,47 @@ def _force_adhoc_macos_signing(env: dict, *, source_mode: bool) -> bool:
     return True
 
 
+def _desktop_linux_apparmor_restricts_userns() -> bool:
+    try:
+        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def _desktop_linux_userns_sandbox_available() -> bool:
+    """Return True when Chromium/Electron can use the user-namespace sandbox.
+
+    Modern Linux desktops (including Fedora Silverblue) normally allow the
+    user-namespace sandbox, so Electron does NOT need a root-owned setuid
+    ``chrome-sandbox`` helper. Prompting for sudo there is needless and scary.
+    Only request setuid-helper configuration when the host actually restricts
+    unprivileged user namespaces.
+    """
+    if sys.platform != "linux":
+        return True
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        # Keep root launches explicit; don't use this helper to justify
+        # weakening the sandbox for root-run Electron.
+        return False
+    if _desktop_linux_apparmor_restricts_userns():
+        return False
+    try:
+        with open("/proc/sys/kernel/unprivileged_userns_clone", encoding="utf-8") as f:
+            if f.read().strip() == "0":
+                return False
+    except OSError:
+        pass
+    try:
+        with open("/proc/sys/user/max_user_namespaces", encoding="utf-8") as f:
+            raw = f.read().strip()
+            if raw and int(raw) <= 0:
+                return False
+    except (OSError, ValueError):
+        pass
+    return True
+
+
 def _desktop_linux_needs_no_sandbox() -> bool:
     """Return True when Chromium/Electron should bypass the Linux sandbox.
 
@@ -5553,11 +5740,7 @@ def _desktop_linux_needs_no_sandbox() -> bool:
         return False
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return False
-    try:
-        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8") as f:
-            return f.read().strip() == "1"
-    except OSError:
-        return False
+    return _desktop_linux_apparmor_restricts_userns()
 
 
 def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> bool:
@@ -5570,6 +5753,31 @@ def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> 
     except OSError:
         return False
     return stat.S_ISREG(sandbox_lstat.st_mode)
+
+
+def _desktop_linux_sandbox_helper_configured(packaged_executable: Path) -> bool:
+    """Return True when Electron's setuid sandbox helper is already usable."""
+    if sys.platform != "linux":
+        return True
+    sandbox = packaged_executable.parent / "chrome-sandbox"
+    try:
+        sandbox_lstat = sandbox.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(sandbox_lstat.st_mode)
+        and sandbox_lstat.st_uid == 0
+        and stat.S_IMODE(sandbox_lstat.st_mode) == 0o4755
+    )
+
+
+def _desktop_linux_should_configure_sandbox_helper(packaged_executable: Path) -> bool:
+    """Return True only when launching safely requires the setuid helper."""
+    if sys.platform != "linux":
+        return False
+    if _desktop_linux_sandbox_helper_configured(packaged_executable):
+        return False
+    return not _desktop_linux_userns_sandbox_available()
 
 
 
@@ -5647,6 +5855,30 @@ def _desktop_launch_options() -> tuple[list[str], str]:
         else:
             disable_gpu = "auto"
     return flags, disable_gpu
+
+
+def _desktop_has_ozone_platform_flag(flags: list[str]) -> bool:
+    return any(flag == "--ozone-platform" or flag.startswith("--ozone-platform=") for flag in flags)
+
+
+def _desktop_default_ozone_platform_flags(env: dict[str, str], configured_flags: list[str]) -> list[str]:
+    """Return Electron ozone flags needed for a visible Linux desktop window."""
+    if sys.platform != "linux" or _desktop_has_ozone_platform_flag(configured_flags):
+        return []
+
+    explicit = env.get("HERMES_DESKTOP_OZONE_PLATFORM", "").strip()
+    if explicit:
+        if explicit.lower() == "auto":
+            return []
+        return [f"--ozone-platform={explicit}"]
+
+    if env.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland" and env.get("DISPLAY"):
+        # Electron/Wayland on Fedora Silverblue/aarch64 can create a live app
+        # process with no mapped toplevel. Passing Chromium's CLI switch is the
+        # reliable route; app.commandLine.appendSwitch is too late for this host.
+        return ["--ozone-platform=x11"]
+
+    return []
 
 
 def cmd_gui(args: argparse.Namespace):
@@ -5733,6 +5965,7 @@ def cmd_gui(args: argparse.Namespace):
             print(f"✓ Desktop {build_label} is up to date (content stamp matches)")
         else:
             print("→ Installing desktop workspace dependencies...")
+            assert npm is not None
             # Put the Hermes-managed Node on PATH so npm's child scripts (which
             # shell out to bare `node`, e.g. electron-winstaller's
             # select-7z-arch.js) resolve it even when the parent PATH is
@@ -5741,7 +5974,12 @@ def cmd_gui(args: argparse.Namespace):
             # NixOS build env keeps its PYTHON hint while restoring managed Node
             # ahead of a bare PATH (same idiom as the `hermes update` path).
             nixos_env = with_hermes_node_path(_nixos_build_env())
-            install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
+            install_result = _run_desktop_dependency_install(
+                npm,
+                PROJECT_ROOT,
+                capture_output=False,
+                env=nixos_env,
+            )
             if install_result.returncode != 0:
                 if not _electron_pkg_staged_missing_dist(PROJECT_ROOT):
                     print("✗ Desktop dependency install failed")
@@ -5854,9 +6092,16 @@ def cmd_gui(args: argparse.Namespace):
             print(f"✓ Desktop packaged app ready: {packaged_executable} (not launching; --build-only)")
         return
 
+    source_ozone_flags = _desktop_default_ozone_platform_flags(env, config_electron_flags)
     if source_mode:
+        assert npm is not None
         print("→ Launching Hermes Desktop from source build...")
-        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
+        launch_result = subprocess.run(
+            [npm, "exec", "--", "electron", ".", *source_ozone_flags, *config_electron_flags],
+            cwd=desktop_dir,
+            env=env,
+            check=False,
+        )
         sys.exit(launch_result.returncode)
 
     if packaged_executable is None:
@@ -5865,13 +6110,15 @@ def cmd_gui(args: argparse.Namespace):
         sys.exit(1)
 
     launch_command = [str(packaged_executable)]
-    if not _desktop_linux_sandbox_fixup(packaged_executable):
+    default_ozone_flags = _desktop_default_ozone_platform_flags(env, config_electron_flags)
+    if _desktop_linux_should_configure_sandbox_helper(packaged_executable) and not _desktop_linux_sandbox_fixup(packaged_executable):
         if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
             print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")
             launch_command.append("--no-sandbox")
         else:
             sys.exit(1)
 
+    launch_command.extend(default_ozone_flags)
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
     launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)

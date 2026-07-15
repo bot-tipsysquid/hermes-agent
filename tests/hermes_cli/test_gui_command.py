@@ -199,6 +199,29 @@ def test_gui_skip_build_launches_existing_packaged_app_without_npm(tmp_path, mon
     assert mock_run.call_args.args[0] == [str(packaged_exe)]
 
 
+def test_gui_linux_skips_sudo_when_userns_sandbox_is_available(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch, platform="linux")
+    sandbox = packaged_exe.parent / "chrome-sandbox"
+    sandbox.write_text("", encoding="utf-8")
+    sandbox.chmod(0o755)
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main._desktop_linux_sandbox_helper_configured", return_value=False), \
+         patch("hermes_cli.main._desktop_linux_userns_sandbox_available", return_value=True), \
+         patch("hermes_cli.main._desktop_default_ozone_platform_flags", return_value=[]), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup") as mock_fixup, \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True))
+
+    assert exc.value.code == 0
+    mock_fixup.assert_not_called()
+    mock_run.assert_called_once()
+    assert mock_run.call_args.args[0] == [str(packaged_exe)]
+
+
 def test_gui_linux_configures_sandbox_before_launch(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
@@ -208,7 +231,9 @@ def test_gui_linux_configures_sandbox_before_launch(tmp_path, monkeypatch):
     sandbox.chmod(0o755)
     ok = subprocess.CompletedProcess([], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
+    with patch("hermes_cli.main._desktop_linux_should_configure_sandbox_helper", return_value=True), \
+         patch("hermes_cli.main._desktop_default_ozone_platform_flags", return_value=[]), \
+         patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
          patch("hermes_cli.main.subprocess.run", return_value=ok) as mock_run, \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns(skip_build=True))
@@ -229,7 +254,8 @@ def test_gui_linux_rejects_symlink_sandbox(tmp_path, monkeypatch):
     sandbox = packaged_exe.parent / "chrome-sandbox"
     sandbox.symlink_to(target)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
+    with patch("hermes_cli.main._desktop_linux_should_configure_sandbox_helper", return_value=True), \
+         patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
          patch("hermes_cli.main.subprocess.run") as mock_run, \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns(skip_build=True))
@@ -258,6 +284,7 @@ def test_gui_linux_skips_fixup_when_already_configured(tmp_path, monkeypatch):
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
     with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
+         patch("hermes_cli.main._desktop_default_ozone_platform_flags", return_value=[]), \
          patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns(skip_build=True))
@@ -277,8 +304,10 @@ def test_gui_linux_falls_back_to_no_sandbox_when_userns_is_restricted(tmp_path, 
 
     launch_ok = subprocess.CompletedProcess([str(packaged_exe), "--no-sandbox"], 0)
 
-    with patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
+    with patch("hermes_cli.main._desktop_linux_should_configure_sandbox_helper", return_value=True), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
          patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=True), \
+         patch("hermes_cli.main._desktop_default_ozone_platform_flags", return_value=[]), \
          patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns(skip_build=True))
@@ -293,7 +322,8 @@ def test_gui_linux_exits_when_sandbox_fixup_fails_without_safe_fallback(tmp_path
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     _make_packaged_executable(root, monkeypatch, platform="linux")
 
-    with patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
+    with patch("hermes_cli.main._desktop_linux_should_configure_sandbox_helper", return_value=True), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
          patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main.subprocess.run") as mock_run, \
          pytest.raises(SystemExit) as exc:
@@ -315,6 +345,7 @@ def test_gui_source_mode_uses_renderer_build_and_electron(tmp_path, monkeypatch)
     with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._desktop_default_ozone_platform_flags", return_value=[]), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main.subprocess.run", side_effect=[build_ok, launch_ok]) as mock_run, \
          pytest.raises(SystemExit) as exc:
@@ -325,6 +356,130 @@ def test_gui_source_mode_uses_renderer_build_and_electron(tmp_path, monkeypatch)
     assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
     assert mock_run.call_args_list[1].args[0] == ["/usr/bin/npm", "exec", "--", "electron", "."]
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
+
+
+def test_desktop_default_ozone_platform_flags_force_x11_on_linux_wayland(monkeypatch):
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+
+    assert cli_main._desktop_default_ozone_platform_flags(
+        {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"},
+        [],
+    ) == ["--ozone-platform=x11"]
+
+
+def test_desktop_default_ozone_platform_flags_honor_explicit_env(monkeypatch):
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+
+    assert cli_main._desktop_default_ozone_platform_flags(
+        {"HERMES_DESKTOP_OZONE_PLATFORM": "wayland", "XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"},
+        [],
+    ) == ["--ozone-platform=wayland"]
+
+
+def test_desktop_default_ozone_platform_flags_auto_and_user_flag_opt_out(monkeypatch):
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    env = {"HERMES_DESKTOP_OZONE_PLATFORM": "auto", "XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}
+
+    assert cli_main._desktop_default_ozone_platform_flags(env, []) == []
+    assert cli_main._desktop_default_ozone_platform_flags(
+        {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"},
+        ["--ozone-platform=wayland"],
+    ) == []
+
+
+def test_desktop_default_ozone_platform_flags_only_linux_wayland_with_xwayland(monkeypatch):
+    monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+    assert cli_main._desktop_default_ozone_platform_flags(
+        {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"},
+        [],
+    ) == []
+
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    assert cli_main._desktop_default_ozone_platform_flags({"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}, []) == []
+    assert cli_main._desktop_default_ozone_platform_flags({"XDG_SESSION_TYPE": "wayland"}, []) == []
+
+
+def test_desktop_dependency_install_uses_toolbox_when_host_lacks_build_tools(tmp_path, capsys):
+    root = tmp_path / "hermes-agent"
+    root.mkdir()
+    ok = subprocess.CompletedProcess(["toolbox", "npm", "ci"], 0)
+
+    with patch("hermes_cli.main._desktop_toolbox_build_container", return_value="hermes-arm-build"), \
+         patch("hermes_cli.main._run_npm_install_deterministic_in_toolbox", return_value=ok) as mock_toolbox_install, \
+         patch("hermes_cli.main._run_npm_install_deterministic") as mock_host_install:
+        result = cli_main._run_desktop_dependency_install(
+            "/usr/bin/npm",
+            root,
+            capture_output=False,
+            env={"EXAMPLE": "1"},
+        )
+
+    assert result is ok
+    mock_host_install.assert_not_called()
+    mock_toolbox_install.assert_called_once_with(
+        "hermes-arm-build",
+        root,
+        capture_output=False,
+        env={"EXAMPLE": "1"},
+    )
+    assert "inside toolbox 'hermes-arm-build'" in capsys.readouterr().out
+
+
+def test_npm_install_in_toolbox_wraps_deterministic_ci(tmp_path, monkeypatch):
+    root = tmp_path / "hermes-agent"
+    root.mkdir()
+    (root / "package-lock.json").write_text("{}", encoding="utf-8")
+    ok = subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: "/usr/bin/toolbox" if name == "toolbox" else None)
+    with patch("hermes_cli.main.subprocess.run", return_value=ok) as mock_run:
+        result = cli_main._run_npm_install_deterministic_in_toolbox(
+            "hermes-arm-build",
+            root,
+            extra_args=("--silent",),
+            capture_output=False,
+        )
+
+    assert result is ok
+    assert mock_run.call_args.args[0] == [
+        "/usr/bin/toolbox",
+        "run",
+        "--container",
+        "hermes-arm-build",
+        "npm",
+        "ci",
+        "--silent",
+    ]
+    assert mock_run.call_args.kwargs["cwd"] == root
+    assert mock_run.call_args.kwargs["capture_output"] is False
+
+
+def test_desktop_toolbox_build_container_prefers_hermes_arm_build(monkeypatch):
+    list_result = subprocess.CompletedProcess(
+        ["toolbox", "list", "--containers"],
+        0,
+        stdout=(
+            "CONTAINER ID  CONTAINER NAME    CREATED     STATUS   IMAGE NAME\n"
+            "b6ec71e08383  hermes-arm-build  9 days ago  running  registry.fedoraproject.org/fedora-toolbox:44\n"
+        ),
+    )
+    probe_ok = subprocess.CompletedProcess(["toolbox", "run"], 0)
+
+    monkeypatch.setattr(cli_main, "_fedora_silverblue_without_host_make", lambda: True)
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: "/usr/bin/toolbox" if name == "toolbox" else None)
+
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["/usr/bin/toolbox", "list", "--containers"]:
+            return list_result
+        return probe_ok
+
+    with patch("hermes_cli.main.subprocess.run", side_effect=fake_run):
+        assert cli_main._desktop_toolbox_build_container() == "hermes-arm-build"
+
+    assert calls[1][:4] == ["/usr/bin/toolbox", "run", "--container", "hermes-arm-build"]
 
 
 @pytest.mark.parametrize(
@@ -582,6 +737,7 @@ def test_gui_retries_pack_once_after_purging_build_cache(tmp_path, monkeypatch):
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
+         patch("hermes_cli.main._desktop_default_ozone_platform_flags", return_value=[]), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._purge_electron_build_cache", return_value=[Path("/c/electron.zip")]) as mock_purge, \
          patch("hermes_cli.main._electron_dist_ok", return_value=False), \
