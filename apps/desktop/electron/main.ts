@@ -104,6 +104,7 @@ import {
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { resolveOzonePlatformSwitch } from './ozone-platform'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import {
   buildSessionWindowUrl,
@@ -128,6 +129,7 @@ import {
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
+import { installDeferredShow } from './window-show'
 import {
   computeWindowOptions,
   debounce,
@@ -169,6 +171,12 @@ const APP_ROOT = app.getAppPath()
 // ESM loader is broken on Electron 40's Node (ERR_INVALID_RETURN_PROPERTY_VALUE).
 // Dev (`npm run dev`) and prod both load the esbuild output from dist/.
 const PRELOAD_PATH = path.join(APP_ROOT, 'dist', 'electron-preload.js')
+
+const OZONE_PLATFORM_SWITCH = resolveOzonePlatformSwitch()
+if (OZONE_PLATFORM_SWITCH) {
+  app.commandLine.appendSwitch('ozone-platform', OZONE_PLATFORM_SWITCH)
+  console.log(`[hermes] forcing Electron ozone platform: ${OZONE_PLATFORM_SWITCH}`)
+}
 
 // Remote displays (SSH X11 forwarding, VNC, RDP) make Chromium's GPU
 // compositor flicker — accelerated layers can't be presented cleanly over the
@@ -7084,11 +7092,7 @@ function spawnSecondaryWindow({
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
 
-  win.once('ready-to-show', () => {
-    if (!win.isDestroyed()) {
-      win.show()
-    }
-  })
+  installDeferredShow(win, { label: 'session', rememberLog })
 
   win.on('enter-full-screen', () => sendWindowStateChanged(true))
   win.on('leave-full-screen', () => sendWindowStateChanged(false))
@@ -7313,11 +7317,7 @@ function createWindow() {
     mainWindow.maximize()
   }
 
-  mainWindow.once('ready-to-show', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.show()
-    }
-  })
+  installDeferredShow(mainWindow, { label: 'main', rememberLog })
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
