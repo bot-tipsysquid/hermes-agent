@@ -1704,3 +1704,86 @@ class TestMoAContextLength:
             "p", base_url="http://127.0.0.1/v1", provider="moa", config_context_length=500_000
         )
         assert ctx == 500_000
+
+
+class TestExtractPricingDictValues:
+    """Regression tests for _extract_pricing handling unhashable values.
+
+    Venice.ai's /v1/models endpoint nests pricing values as dicts:
+    ``model_spec.pricing.input = {"usd": 1.4, "diem": 1.4}``. The original
+    check ``normalized[alias] not in {None, ""}`` invoked set membership,
+    which requires hashing the value — a dict raises ``TypeError:
+    cannot use 'dict' as a set element``. The exception escaped
+    ``_extract_pricing`` and was swallowed by the bare ``except`` in
+    ``fetch_endpoint_model_metadata``, silently nuking the whole cache
+    for the endpoint. These tests pin the hash-free behaviour.
+    """
+
+    def test_dict_value_in_pricing_does_not_raise(self):
+        from agent.model_metadata import _extract_pricing
+
+        payload = {
+            "id": "zai-org-glm-5-2",
+            "context_length": 1_000_000,
+            "model_spec": {
+                "pricing": {
+                    "input": {"usd": 1.4, "diem": 1.4},
+                    "cache_input": {"usd": 0.26, "diem": 0.26},
+                    "output": {"usd": 4.4, "diem": 4.4},
+                },
+            },
+        }
+        # Must not raise on the dict-valued alias.
+        result = _extract_pricing(payload)
+        assert "prompt" in result
+        assert "completion" in result
+        # Values are propagated as-is; consumers (_to_decimal, _openrouter_*) are exception-safe.
+        assert result["prompt"] == {"usd": 1.4, "diem": 1.4}
+        assert result["completion"] == {"usd": 4.4, "diem": 4.4}
+
+    def test_fetch_endpoint_model_metadata_venice_shape(self):
+        """End-to-end: a Venice-shaped /v1/models response must populate
+        the cache with context_length intact (regression for the bug
+        that silently dropped ALL entries because the inner parse loop
+        raised before reaching the dict-parse for ``input``)."""
+        from agent.model_metadata import fetch_endpoint_model_metadata
+        from unittest.mock import patch, MagicMock
+
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "data": [
+                {
+                    "id": "zai-org-glm-5-2",
+                    "context_length": 1_000_000,
+                    "model_spec": {
+                        "pricing": {
+                            "input": {"usd": 1.4, "diem": 1.4},
+                            "output": {"usd": 4.4, "diem": 4.4},
+                        },
+                    },
+                },
+                {
+                    "id": "z-ai-glm-5-turbo",
+                    "context_length": 200_000,
+                    "model_spec": {
+                        "pricing": {
+                            "input": {"usd": 1.2, "diem": 1.2},
+                            "output": {"usd": 4.0, "diem": 4.0},
+                        },
+                    },
+                },
+            ]
+        }
+        with patch("agent.model_metadata.requests.get", return_value=resp):
+            md = fetch_endpoint_model_metadata(
+                "https://api.venice.ai/api/v1",
+                api_key="test-key",
+                force_refresh=True,
+            )
+        assert len(md) == 2, f"expected 2 models in cache, got {len(md)}: {md!r}"
+        assert md["zai-org-glm-5-2"]["context_length"] == 1_000_000
+        assert md["z-ai-glm-5-turbo"]["context_length"] == 200_000
+        # Pricing entries do get populated now (not silently empty).
+        assert "pricing" in md["zai-org-glm-5-2"]
+        assert md["zai-org-glm-5-2"]["pricing"]["prompt"] == {"usd": 1.4, "diem": 1.4}

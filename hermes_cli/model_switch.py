@@ -2144,11 +2144,24 @@ def list_authenticated_providers(
         )
     ):
         _models = [current_model] if current_model else []
-        if refresh or probe_current_custom_provider:
+        _bare_api_url = str(current_base_url).strip().rstrip("/")
+        if _bare_api_url and (refresh or probe_current_custom_provider):
+            _bare_api_key = ""
+            try:
+                from hermes_cli.config import load_config
+
+                _bare_cfg = load_config()
+                _bare_model_cfg = (
+                    _bare_cfg.get("model") if isinstance(_bare_cfg, dict) else None
+                )
+                if isinstance(_bare_model_cfg, dict):
+                    _bare_api_key = str(_bare_model_cfg.get("api_key", "") or "").strip()
+            except Exception:
+                pass
             try:
                 from hermes_cli.models import fetch_api_models
 
-                _live_models = fetch_api_models("", str(current_base_url).strip().rstrip("/"))
+                _live_models = fetch_api_models(_bare_api_key, _bare_api_url)
                 if _live_models:
                     _models = _live_models
             except Exception:
@@ -2161,7 +2174,7 @@ def list_authenticated_providers(
             "models": _models[:max_models] if max_models is not None else _models,
             "total_models": len(_models),
             "source": "model-config",
-            "api_url": str(current_base_url).strip().rstrip("/"),
+            "api_url": _bare_api_url,
         })
         seen_slugs.add("custom")
 

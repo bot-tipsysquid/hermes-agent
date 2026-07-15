@@ -872,7 +872,15 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         pricing: Dict[str, Any] = {}
         for target, aliases in alias_map.items():
             for alias in aliases:
-                if alias in normalized and normalized[alias] not in {None, ""}:
+                # Use explicit equality rather than ``not in {None, ""}``:
+                # that membership test requires hashing the value, so a dict
+                # or list value (e.g. Venice's ``model_spec.pricing.input``
+                # shaped as ``{"usd": 1.4, "diem": 1.4}``) raises
+                # ``TypeError: cannot use 'dict' as a set element`` and the
+                # entire ``fetch_endpoint_model_metadata`` call silently
+                # falls back to an empty cache — breaking context_length
+                # probing for the endpoint entirely. See Venice.ai reports.
+                if alias in normalized and normalized[alias] is not None and normalized[alias] != "":
                     pricing[target] = normalized[alias]
                     break
         if pricing:
