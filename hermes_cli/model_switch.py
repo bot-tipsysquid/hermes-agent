@@ -2436,6 +2436,11 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
     normal providers; gateway pickers call ``list_picker_providers()`` directly,
     so they need the same virtual row here. Reuse the inventory's single row
     builder so the row shape stays defined in one place.
+
+    Keep the active provider first. Telegram/Discord render this list directly,
+    so blindly prepending MoA makes the common "switch within my current
+    provider" flow start on a virtual provider instead of the provider the
+    session is actually using.
     """
     try:
         from hermes_cli.inventory import _moa_provider_row
@@ -2443,7 +2448,18 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
         moa_row = _moa_provider_row(current_provider)
         if moa_row is None:
             return providers
-        return [moa_row] + [p for p in providers if str(p.get("slug", "")).lower() != "moa"]
+        others = [
+            p for p in providers
+            if str(p.get("slug", "")).strip().lower() != "moa"
+        ]
+        current_norm = str(current_provider or "").strip().lower()
+        if str(moa_row.get("slug", "")).strip().lower() == current_norm or moa_row.get("is_current"):
+            return [moa_row, *others]
+        for idx, provider in enumerate(others):
+            slug = str(provider.get("slug", "")).strip().lower()
+            if provider.get("is_current") or (current_norm and slug == current_norm):
+                return [*others[:idx + 1], moa_row, *others[idx + 1:]]
+        return [*others, moa_row]
     except Exception:
         return providers
 

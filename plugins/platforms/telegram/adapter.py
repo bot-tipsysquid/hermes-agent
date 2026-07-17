@@ -5409,7 +5409,46 @@ class TelegramAdapter(BasePlatformAdapter):
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
         return InlineKeyboardMarkup(rows), page_info
 
-    def _build_model_keyboard(self, models: list, page: int) -> tuple:
+    _MODEL_PAGE_SIZE = 8
+
+    @staticmethod
+    def _prioritize_current_model(models: list, current_model: str) -> list:
+        """Return models with the active model first, preserving all others."""
+        if not current_model:
+            return list(models)
+        prioritized: list = []
+        seen_current = False
+        for model_id in models:
+            if model_id == current_model:
+                if not seen_current:
+                    prioritized.insert(0, model_id)
+                    seen_current = True
+                continue
+            prioritized.append(model_id)
+        if not seen_current:
+            prioritized.insert(0, current_model)
+        return prioritized
+
+    def _model_picker_extra_text(
+        self, *, total: int, shown: int, provider_slug: str
+    ) -> str:
+        """Return compact helper text for large/paginated model lists."""
+        if total > shown:
+            missing = total - shown
+            return (
+                f"\n_{missing} more available — type "
+                f"`/model <name> --provider {provider_slug}` directly_"
+            )
+        if shown > self._MODEL_PAGE_SIZE:
+            return (
+                "\n_Tip: type "
+                f"`/model <name> --provider {provider_slug}` to skip paging_"
+            )
+        return ""
+
+    def _build_model_keyboard(
+        self, models: list, page: int, current_model: str = ""
+    ) -> tuple:
         """Build paginated model buttons. Returns (keyboard, page_info_text)."""
         page_size = self._MODEL_PAGE_SIZE
         total = len(models)
@@ -5426,6 +5465,8 @@ class TelegramAdapter(BasePlatformAdapter):
             short = model_id.split("/")[-1] if "/" in model_id else model_id
             if len(short) > 38:
                 short = short[:35] + "..."
+            if current_model and model_id == current_model:
+                short = f"✓ {short}"
             buttons.append(
                 InlineKeyboardButton(short, callback_data=f"mm:{abs_idx}")
             )
@@ -5476,18 +5517,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Provider not found.")
                 return
 
-            models = provider.get("models", [])
+            models = list(provider.get("models", []))
+            selected_current_model = (
+                state.get("current_model", "")
+                if provider.get("is_current") or provider_slug == state.get("current_provider")
+                else ""
+            )
+            models = self._prioritize_current_model(models, selected_current_model)
             state["selected_provider"] = provider_slug
             state["selected_provider_name"] = provider.get("name", provider_slug)
+            state["selected_current_model"] = selected_current_model
             state["model_list"] = models
             state["model_page"] = 0
 
-            keyboard, page_info = self._build_model_keyboard(models, 0)
+            keyboard, page_info = self._build_model_keyboard(
+                models, 0, current_model=selected_current_model
+            )
 
             pname = provider.get("name", provider_slug)
             total = provider.get("total_models", len(models))
             shown = len(models)
-            extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
+            extra = self._model_picker_extra_text(
+                total=total, shown=shown, provider_slug=provider_slug
+            )
 
             await query.edit_message_text(
                 text=self.format_message(
@@ -5513,7 +5565,11 @@ class TelegramAdapter(BasePlatformAdapter):
             models = state.get("model_list", [])
             state["model_page"] = page
 
-            keyboard, page_info = self._build_model_keyboard(models, page)
+            keyboard, page_info = self._build_model_keyboard(
+                models,
+                page,
+                current_model=state.get("selected_current_model", ""),
+            )
 
             pname = state.get("selected_provider_name", "")
             provider_slug = state.get("selected_provider", "")
@@ -5523,7 +5579,9 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             total = provider.get("total_models", len(models)) if provider else len(models)
             shown = len(models)
-            extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
+            extra = self._model_picker_extra_text(
+                total=total, shown=shown, provider_slug=provider_slug
+            )
 
             await query.edit_message_text(
                 text=self.format_message(
