@@ -448,6 +448,7 @@ def test_npm_install_in_toolbox_wraps_deterministic_ci(tmp_path, monkeypatch):
         "hermes-arm-build",
         "npm",
         "ci",
+        "--include=dev",
         "--silent",
     ]
     assert mock_run.call_args.kwargs["cwd"] == root
