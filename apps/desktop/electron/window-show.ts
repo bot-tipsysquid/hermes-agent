@@ -15,6 +15,7 @@ export function installDeferredShow(
   options: {
     didFinishLoadFallback?: boolean
     label?: string
+    onShown?: () => void
     platform?: string
     rememberLog?: (line: string) => void
   } = {}
@@ -34,6 +35,7 @@ export function installDeferredShow(
     }
 
     win.show?.()
+    options.onShown?.()
     rememberLog?.(`[window] showing ${label} via ${reason}`)
     return true
   }

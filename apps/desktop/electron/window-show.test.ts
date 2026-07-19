@@ -68,6 +68,24 @@ test('ready-to-show wins and did-finish-load does not show twice', () => {
   assert.equal(win.showCount, 1)
 })
 
+test('runs onShown exactly once when fallback makes a non-mac window visible', () => {
+  const win = fakeWindow()
+  let shown = 0
+
+  installDeferredShow(win, {
+    onShown: () => {
+      shown += 1
+    },
+    platform: 'linux'
+  })
+
+  win.webContents.emit('did-finish-load')
+  win.emit('ready-to-show')
+
+  assert.equal(win.showCount, 1)
+  assert.equal(shown, 1)
+})
+
 test('destroyed windows are not shown by deferred events', () => {
   const win = fakeWindow()
   win.destroyed = true
