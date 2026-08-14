@@ -45,11 +45,19 @@ test('auto override leaves Chromium default untouched', () => {
 
 test('does not override non-linux, x11 sessions, missing XWayland, or user args', () => {
   assert.equal(
-    resolveOzonePlatformSwitch({ platform: 'darwin', env: { XDG_SESSION_TYPE: 'wayland', DISPLAY: ':0' }, argv: ['Hermes'] }),
+    resolveOzonePlatformSwitch({
+      platform: 'darwin',
+      env: { XDG_SESSION_TYPE: 'wayland', DISPLAY: ':0' },
+      argv: ['Hermes']
+    }),
     null
   )
   assert.equal(
-    resolveOzonePlatformSwitch({ platform: 'linux', env: { XDG_SESSION_TYPE: 'x11', DISPLAY: ':0' }, argv: ['Hermes'] }),
+    resolveOzonePlatformSwitch({
+      platform: 'linux',
+      env: { XDG_SESSION_TYPE: 'x11', DISPLAY: ':0' },
+      argv: ['Hermes']
+    }),
     null
   )
   assert.equal(
