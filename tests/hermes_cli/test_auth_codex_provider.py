@@ -540,6 +540,7 @@ def test_refresh_429_classified_as_quota_not_auth_failure(monkeypatch):
     assert err.relogin_required is False
     assert is_rate_limited_auth_error(err) is True
     assert "retry after 120s" in str(err)
+    assert "(resets " in str(err)
     # User-facing copy must not tell the operator to re-authenticate.
     rendered = format_auth_error(err)
     assert "re-authenticate" not in rendered

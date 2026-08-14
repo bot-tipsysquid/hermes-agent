@@ -240,6 +240,24 @@ def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     assert entry["last_error_reset_at"] is None
 
 
+def test_resolver_cooldown_error_includes_absolute_reset_time(tmp_path, monkeypatch):
+    """A persisted future cooldown should be actionable without mental math."""
+    hermes_home = tmp_path / "hermes"
+    _write_auth_store(hermes_home, _pool_only_rate_limited_store())
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kw: False
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials()
+
+    message = str(exc_info.value)
+    assert "retry after " in message
+    assert "(resets " in message
+    assert "Credentials are still valid." in message
+
+
 
 
 # ---------------------------------------------------------------------------

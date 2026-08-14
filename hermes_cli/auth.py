@@ -3864,9 +3864,12 @@ def refresh_codex_oauth_pure(
         # "run hermes auth" prompt (see issue #32790).
         retry_after = _parse_retry_after_seconds(getattr(response, "headers", None))
         if retry_after is not None:
+            from datetime import datetime, timezone
+            reset_dt = datetime.fromtimestamp(time.time() + retry_after, tz=timezone.utc).astimezone()
+            reset_str = reset_dt.strftime("%Y-%m-%d %H:%M %Z")
             message = (
-                f"Codex provider quota exhausted (429); retry after {retry_after}s. "
-                "Credentials are still valid."
+                f"Codex provider quota exhausted (429); retry after {retry_after}s "
+                f"(resets {reset_str}). Credentials are still valid."
             )
         else:
             message = (
@@ -4117,9 +4120,12 @@ def resolve_codex_runtime_credentials(
             reset_at = pool_rate_limit.get("reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 remaining = int(reset_at - time.time())
+                from datetime import datetime, timezone
+                reset_dt = datetime.fromtimestamp(reset_at, tz=timezone.utc).astimezone()
+                reset_str = reset_dt.strftime("%Y-%m-%d %H:%M %Z")
                 message = (
-                    f"Codex provider quota exhausted (429); retry after {remaining}s. "
-                    "Credentials are still valid."
+                    f"Codex provider quota exhausted (429); retry after {remaining}s "
+                    f"(resets {reset_str}). Credentials are still valid."
                 )
             else:
                 message = (
