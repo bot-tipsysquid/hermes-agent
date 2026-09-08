@@ -3864,7 +3864,6 @@ def refresh_codex_oauth_pure(
         # "run hermes auth" prompt (see issue #32790).
         retry_after = _parse_retry_after_seconds(getattr(response, "headers", None))
         if retry_after is not None:
-            from datetime import datetime, timezone
             reset_dt = datetime.fromtimestamp(time.time() + retry_after, tz=timezone.utc).astimezone()
             reset_str = reset_dt.strftime("%Y-%m-%d %H:%M %Z")
             message = (
