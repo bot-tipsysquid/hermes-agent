@@ -23,13 +23,15 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
 import httpx
 
+from hermes_constants import get_process_hermes_home
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -134,6 +136,169 @@ def _ext_to_mime(ext: str) -> str:
     """Map file extension to MIME type."""
     # preserves historical signal mapping (shared table matches verbatim)
     return mime_for_ext(ext, fallback="application/octet-stream")
+
+
+class _AttachmentStagingError(Exception):
+    """Raised when outbound files cannot be copied into Signal's outbox."""
+
+
+def _stage_outbound_attachments_sync(
+    file_paths: List[str],
+) -> Tuple[Path, List[str]]:
+    """Copy outbound files into the path shared with containerized signal-cli.
+
+    This helper performs blocking filesystem I/O and must run in a worker.
+    signal-cli reads attachment paths in its own filesystem namespace. A host
+    path can exist for Hermes while being absent from a sidecar. Stage
+    short-lived byte-identical copies under Hermes' artifact outbox, which a
+    container deployment can mount read-only at the same absolute path.
+    """
+    try:
+        outbox = get_process_hermes_home() / "artifacts" / "signal-outbox"
+        outbox.mkdir(parents=True, exist_ok=True)
+        stage_root = Path(tempfile.mkdtemp(prefix="send-", dir=outbox))
+    except OSError as e:
+        raise _AttachmentStagingError(str(e)) from e
+
+    try:
+        staged: List[str] = []
+        for index, file_path in enumerate(file_paths):
+            source = Path(file_path)
+            target_dir = stage_root / str(index)
+            target_dir.mkdir()
+            target = target_dir / source.name
+            shutil.copyfile(source, target)
+            staged.append(str(target))
+    except BaseException as e:
+        try:
+            shutil.rmtree(stage_root)
+        except Exception as cleanup_error:
+            logger.warning(
+                "Signal: failed to clean partially staged attachments at %s: %s",
+                stage_root,
+                cleanup_error,
+            )
+        if isinstance(e, OSError):
+            raise _AttachmentStagingError(str(e)) from e
+        raise
+    return stage_root, staged
+
+
+class _StagedOutboundAttachments:
+    """A staged attachment tree with an explicit RPC-acceptance boundary."""
+
+    def __init__(self, attachments: List[str]) -> None:
+        self.attachments = attachments
+        self.committed = False
+        self.cancellation_requested = False
+
+    def commit(self) -> None:
+        """Mark the send accepted so later cancellation cannot invite a retry."""
+        self.committed = True
+
+
+def _clear_current_task_cancellation() -> None:
+    """Discard cancellation requests intentionally suppressed after commit."""
+    task = asyncio.current_task()
+    if task is None:
+        return
+    while task.cancelling():
+        task.uncancel()
+
+
+async def _cleanup_staged_attachments(stage_root: Path) -> bool:
+    """Remove a staged tree off-loop, returning whether cancellation intervened.
+
+    Repeated cancellation must not cancel the asyncio wrapper around the
+    ``to_thread`` worker: the worker would keep running while its result (and
+    therefore the cleanup completion boundary) was lost.
+    """
+    cleanup_task = asyncio.create_task(asyncio.to_thread(shutil.rmtree, stage_root))
+    cancellation_requested = False
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError:
+            if cleanup_task.cancelled():
+                raise
+            cancellation_requested = True
+        except Exception as e:
+            # The RPC may already have accepted the send. Cleanup must not turn
+            # delivery into a reported failure that a caller could retry.
+            logger.warning(
+                "Signal: failed to clean staged attachments at %s: %s",
+                stage_root,
+                e,
+            )
+            break
+    return cancellation_requested
+
+
+async def _finish_post_commit_task(task: "asyncio.Task[None]") -> bool:
+    """Finish accepted-send bookkeeping despite repeated cancellation."""
+    cancellation_requested = False
+    while True:
+        try:
+            await asyncio.shield(task)
+            return cancellation_requested
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancellation_requested = True
+
+
+@asynccontextmanager
+async def _stage_outbound_attachments(
+    file_paths: List[str],
+) -> AsyncIterator[_StagedOutboundAttachments]:
+    """Stage attachments and enforce pre/post-accept cancellation semantics.
+
+    Cancellation before ``commit()`` propagates only after the staged tree has
+    been removed. Cancellation after ``commit()`` is intentionally suppressed:
+    the remote send is accepted, so surfacing cancellation would make it look
+    retryable and could duplicate the message.
+    """
+    stage_task = asyncio.create_task(
+        asyncio.to_thread(_stage_outbound_attachments_sync, file_paths)
+    )
+    staging_cancelled = False
+    while True:
+        try:
+            stage_root, attachments = await asyncio.shield(stage_task)
+            break
+        except asyncio.CancelledError:
+            if stage_task.cancelled():
+                raise
+            staging_cancelled = True
+        except Exception:
+            if staging_cancelled:
+                raise asyncio.CancelledError() from None
+            raise
+
+    if staging_cancelled:
+        await _cleanup_staged_attachments(stage_root)
+        raise asyncio.CancelledError()
+
+    staged = _StagedOutboundAttachments(attachments)
+    try:
+        yield staged
+    except asyncio.CancelledError:
+        await _cleanup_staged_attachments(stage_root)
+        if not staged.committed:
+            raise
+        _clear_current_task_cancellation()
+    except BaseException:
+        cleanup_cancelled = await _cleanup_staged_attachments(stage_root)
+        if cleanup_cancelled:
+            raise asyncio.CancelledError() from None
+        raise
+    else:
+        cleanup_cancelled = await _cleanup_staged_attachments(stage_root)
+        if staged.cancellation_requested or cleanup_cancelled:
+            if not staged.committed:
+                raise asyncio.CancelledError()
+            _clear_current_task_cancellation()
 
 
 def _remux_aac_to_m4a(aac_data: bytes) -> Optional[Tuple[bytes, str]]:
@@ -1269,22 +1434,34 @@ class SignalAdapter(BasePlatformAdapter):
                     chat_id, idx + 1, len(att_batches), estimated
                 )
 
-            params = dict(base_params, attachments=att_batch)
             send_timeout = _signal_send_timeout(n)
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
                 await scheduler.acquire(n)
                 try:
                     _rpc_t0 = time.monotonic()
-                    result = await self._rpc(
-                        "send", params, raise_on_rate_limit=True, timeout=send_timeout,
-                    )
-                    _rpc_duration = time.monotonic() - _rpc_t0
+                    send_success = False
+                    err_msg = None
+                    async with _stage_outbound_attachments(att_batch) as staged_batch:
+                        params = dict(
+                            base_params, attachments=staged_batch.attachments
+                        )
+                        result = await self._rpc(
+                            "send", params, raise_on_rate_limit=True, timeout=send_timeout,
+                        )
+                        _rpc_duration = time.monotonic() - _rpc_t0
+                        if result is not None:
+                            send_success, err_msg = self._validate_send_result(result)
+                            if send_success:
+                                self._track_sent_timestamp(result)
+                                staged_batch.commit()
+                                report_task = asyncio.create_task(
+                                    scheduler.report_rpc_duration(_rpc_duration, n)
+                                )
+                                if await _finish_post_commit_task(report_task):
+                                    staged_batch.cancellation_requested = True
                     if result is not None:
-                        success, err_msg = self._validate_send_result(result)
-                        if success:
-                            self._track_sent_timestamp(result)
-                            await scheduler.report_rpc_duration(_rpc_duration, n)
+                        if send_success:
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
                                 "(attempt %d/%d)",
@@ -1326,6 +1503,15 @@ class SignalAdapter(BasePlatformAdapter):
                             )
                             await asyncio.sleep(backoff)
                             continue
+                    break
+                except _AttachmentStagingError as e:
+                    logger.error(
+                        "Signal: failed to stage batch %d/%d (%d attachments): %s",
+                        idx + 1,
+                        len(att_batches),
+                        n,
+                        e,
+                    )
                     break
                 except SignalRateLimitError as e:
                     scheduler.feedback(e.retry_after, n)
@@ -1393,25 +1579,13 @@ class SignalAdapter(BasePlatformAdapter):
         if file_size > SIGNAL_MAX_ATTACHMENT_SIZE:
             return SendResult(success=False, error=f"Image too large ({file_size} bytes)")
 
-        params: Dict[str, Any] = {
-            "account": self.account,
-            "message": caption or "",
-            "attachments": [file_path],
-        }
-
-        if chat_id.startswith("group:"):
-            params["groupId"] = chat_id[6:]
-        else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
-
-        result = await self._rpc("send", params)
-        if result is not None:
-            success, err_msg = self._validate_send_result(result)
-            if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
-            self._track_sent_timestamp(result)
-            return SendResult(success=True)
-        return SendResult(success=False, error="RPC send with attachment failed")
+        return await self._send_attachment(
+            chat_id,
+            file_path,
+            "Image",
+            caption,
+            stop_typing=False,
+        )
 
     async def _send_attachment(
         self,
@@ -1419,13 +1593,16 @@ class SignalAdapter(BasePlatformAdapter):
         file_path: str,
         media_label: str,
         caption: Optional[str] = None,
+        *,
+        stop_typing: bool = True,
     ) -> SendResult:
         """Send any file as a Signal attachment via RPC.
 
         Shared implementation for send_document, send_image_file, send_voice,
         and send_video — avoids duplicating the validation/routing/RPC logic.
         """
-        await self._stop_typing_indicator(chat_id)
+        if stop_typing:
+            await self._stop_typing_indicator(chat_id)
 
         try:
             file_size = Path(file_path).stat().st_size
@@ -1438,7 +1615,6 @@ class SignalAdapter(BasePlatformAdapter):
         params: Dict[str, Any] = {
             "account": self.account,
             "message": caption or "",
-            "attachments": [file_path],
         }
 
         if chat_id.startswith("group:"):
@@ -1446,14 +1622,33 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        result = await self._rpc("send", params)
-        if result is not None:
-            success, err_msg = self._validate_send_result(result)
-            if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
-            self._track_sent_timestamp(result)
-            return SendResult(success=True)
-        return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
+        try:
+            async with _stage_outbound_attachments([file_path]) as staged:
+                params["attachments"] = staged.attachments
+                result = await self._rpc("send", params)
+                if result is None:
+                    send_result = SendResult(
+                        success=False,
+                        error=f"RPC send {media_label.lower()} failed",
+                    )
+                else:
+                    success, err_msg = self._validate_send_result(result)
+                    if not success:
+                        send_result = SendResult(
+                            success=False,
+                            error=err_msg,
+                            raw_response=result,
+                        )
+                    else:
+                        self._track_sent_timestamp(result)
+                        send_result = SendResult(success=True)
+                        staged.commit()
+        except _AttachmentStagingError as e:
+            return SendResult(
+                success=False,
+                error=f"Failed to stage {media_label.lower()}: {e}",
+            )
+        return send_result
 
     async def send_document(
         self,

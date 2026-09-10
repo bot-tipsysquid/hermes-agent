@@ -1942,7 +1942,7 @@ _MEDIA_EXT_ALTERNATION = "|".join(
 MEDIA_TAG_CLEANUP_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+?`|"[^"\n]+?"|'[^'\n]+?'|'''
-    r'''(?:~/|/|[A-Za-z]:[/\\])\S+?(?:[^\S\n]+\S+?)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
+    r'''(?:~/|/|[A-Za-z]:[/\\])(?:(?!MEDIA:)\S)+?(?:[^\S\n]+(?:(?!MEDIA:)\S)+?)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
     r'''(?=[\s`"'*_,;:)\]}\[]|MEDIA:|\.(?:\s|$)|$)[`"'*_]{0,3}\.?''',
     re.IGNORECASE,
 )
@@ -4909,7 +4909,9 @@ class BasePlatformAdapter(ABC):
         # referenced twice in one response — e.g. a MEDIA tag inline AND in a
         # summary footer — is uploaded once, not twice (#29131).
         seen_paths: set = set()
-        for match in media_pattern.finditer(scan_content):
+        known_matches = list(media_pattern.finditer(scan_content))
+        known_media_spans = [match.span() for match in known_matches]
+        for match in known_matches:
             path = _normalize_media_tag_path(match.group("path"))
             if path:
                 # ``[[audio_as_voice]]`` is message-global, but it must only
@@ -4932,6 +4934,17 @@ class BasePlatformAdapter(ABC):
                     media.append((expanded, is_voice))
 
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
+            # The fallback regex intentionally stops at whitespace. When a
+            # known-extension MEDIA tag contains spaces, that shorter match can
+            # name a different, real extensionless file (for example,
+            # ``/home/user/Hermes`` inside ``/home/user/Hermes Vault/x.mp3``).
+            # The known tag owns the whole span; never treat an overlapping
+            # fallback match as a second attachment.
+            if any(
+                match.start() < end and match.end() > start
+                for start, end in known_media_spans
+            ):
+                continue
             path = _normalize_media_tag_path(match.group("path"))
             if not path or not _path_lacks_deliverable_extension(path):
                 continue

@@ -195,6 +195,43 @@ class TestExtractMedia:
         assert media[0][0] == "/path/to/audio.ogg"
         assert media[0][1] is False  # no voice tag
 
+    def test_spaced_known_path_does_not_add_existing_extensionless_prefix(
+        self, monkeypatch, tmp_path
+    ):
+        """One MEDIA tag must not upload a real prefix file as a second attachment."""
+        prefix = tmp_path / "Hermes"
+        prefix.write_text("unrelated", encoding="utf-8")
+        audio = tmp_path / "Hermes Vault" / "output" / "narration.mp3"
+        audio.parent.mkdir(parents=True)
+        audio.write_bytes(b"audio")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (str(tmp_path),)
+        )
+
+        media, cleaned = BasePlatformAdapter.extract_media(f"MEDIA:{audio}")
+
+        assert media == [(str(audio), False)]
+        assert cleaned == ""
+
+    def test_glued_extensionless_and_known_tags_both_survive(
+        self, monkeypatch, tmp_path
+    ):
+        """A known tag must not absorb an adjacent extensionless MEDIA tag."""
+        caddyfile = tmp_path / "Caddyfile"
+        caddyfile.write_text("localhost {}", encoding="utf-8")
+        audio = tmp_path / "reply.mp3"
+        audio.write_bytes(b"audio")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (str(tmp_path),)
+        )
+
+        media, cleaned = BasePlatformAdapter.extract_media(
+            f"MEDIA:{caddyfile}MEDIA:{audio}"
+        )
+
+        assert {path for path, _ in media} == {str(caddyfile), str(audio)}
+        assert cleaned == ""
+
 
     def test_voice_directive_only_taints_audio_files(self):
         """[[audio_as_voice]] is message-global but must only flag audio files.

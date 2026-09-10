@@ -378,13 +378,316 @@ class TestSignalSendImageFile:
         assert captured[0]["method"] == "send"
         assert captured[0]["params"]["account"] == adapter.account
         assert captured[0]["params"]["recipient"] == ["+155****4567"]
-        assert captured[0]["params"]["attachments"] == [str(img_path)]
+        sent_path = Path(captured[0]["params"]["attachments"][0])
+        assert sent_path.name == img_path.name
+        assert "signal-outbox" in sent_path.parts
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         # Typing indicator must be stopped before sending
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         # Timestamp must be tracked for echo-back prevention
         assert 1234567890 in adapter._recent_sent_timestamps
 
+    @pytest.mark.asyncio
+    async def test_send_image_stages_file_in_shared_signal_outbox(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+
+        image_path = tmp_path / "private" / "chart.png"
+        image_path.parent.mkdir()
+        image_bytes = b"\x89PNG" + b"\x00" * 100
+        image_path.write_bytes(image_bytes)
+        staged_path = None
+
+        async def capture_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal staged_path
+            staged_path = Path(params["attachments"][0])
+            assert staged_path.is_relative_to(
+                hermes_home / "artifacts" / "signal-outbox"
+            )
+            assert staged_path.read_bytes() == image_bytes
+            return {"timestamp": 1234567890}
+
+        adapter._rpc = capture_rpc
+        result = await adapter.send_image(
+            chat_id="+155****4567", image_url=f"file://{image_path}"
+        )
+
+        assert result.success is True
+        adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
+        assert staged_path is not None
+        assert not staged_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_staging_and_cleanup_run_off_event_loop(
+        self, monkeypatch, tmp_path
+    ):
+        import shutil
+        import threading
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        image_path = tmp_path / "chart.png"
+        image_path.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        loop_thread = threading.get_ident()
+        copy_threads = []
+        cleanup_threads = []
+        real_copyfile = shutil.copyfile
+        real_rmtree = shutil.rmtree
+
+        def tracking_copyfile(*args, **kwargs):
+            copy_threads.append(threading.get_ident())
+            return real_copyfile(*args, **kwargs)
+
+        def tracking_rmtree(*args, **kwargs):
+            cleanup_threads.append(threading.get_ident())
+            return real_rmtree(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "gateway.platforms.signal.shutil.copyfile", tracking_copyfile
+        )
+        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", tracking_rmtree)
+        adapter._rpc, _ = _stub_rpc({"timestamp": 1})
+
+        result = await adapter.send_image_file(
+            chat_id="+155****4567", image_path=str(image_path)
+        )
+
+        assert result.success is True
+        assert copy_threads and all(t != loop_thread for t in copy_threads)
+        assert cleanup_threads and all(t != loop_thread for t in cleanup_threads)
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_during_staging_cleans_completed_tree(
+        self, monkeypatch, tmp_path
+    ):
+        import threading
+
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        adapter._rpc = AsyncMock()
+        image_path = tmp_path / "chart.png"
+        image_path.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        from gateway.platforms import signal as signal_module
+
+        real_stage = signal_module._stage_outbound_attachments_sync
+        loop = asyncio.get_running_loop()
+        stage_started = asyncio.Event()
+        stage_finished = asyncio.Event()
+        release_stage = threading.Event()
+
+        def blocked_stage(file_paths):
+            loop.call_soon_threadsafe(stage_started.set)
+            release_stage.wait()
+            try:
+                return real_stage(file_paths)
+            finally:
+                loop.call_soon_threadsafe(stage_finished.set)
+
+        monkeypatch.setattr(
+            "gateway.platforms.signal._stage_outbound_attachments_sync",
+            blocked_stage,
+        )
+        send_task = asyncio.create_task(
+            adapter.send_image_file(
+                chat_id="+155****4567", image_path=str(image_path)
+            )
+        )
+        await asyncio.wait_for(stage_started.wait(), timeout=1)
+
+        send_task.cancel()
+        await asyncio.sleep(0)
+        send_task.cancel()
+        await asyncio.sleep(0)
+        recovery_was_pending = not send_task.done()
+        release_stage.set()
+        await asyncio.wait_for(stage_finished.wait(), timeout=1)
+
+        assert recovery_was_pending
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+
+        outbox = hermes_home / "artifacts" / "signal-outbox"
+        assert not list(outbox.glob("send-*"))
+        adapter._rpc.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_before_acceptance_cleans_then_propagates(
+        self, monkeypatch, tmp_path
+    ):
+        import shutil
+        import threading
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        image_path = tmp_path / "chart.png"
+        image_path.write_bytes(b"\x89PNG" + b"\x00" * 100)
+        loop = asyncio.get_running_loop()
+        rpc_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        release_cleanup = threading.Event()
+        staged_path = None
+        real_rmtree = shutil.rmtree
+
+        def blocked_rmtree(*args, **kwargs):
+            loop.call_soon_threadsafe(cleanup_started.set)
+            release_cleanup.wait()
+            try:
+                return real_rmtree(*args, **kwargs)
+            finally:
+                loop.call_soon_threadsafe(cleanup_finished.set)
+
+        async def blocked_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal staged_path
+            staged_path = Path(params["attachments"][0])
+            assert staged_path.exists()
+            rpc_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        adapter._rpc = blocked_rpc
+        send_task = asyncio.create_task(
+            adapter.send_image_file(
+                chat_id="+155****4567", image_path=str(image_path)
+            )
+        )
+        await rpc_started.wait()
+
+        send_task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        send_task.cancel()
+        await asyncio.sleep(0)
+        send_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_was_pending = not send_task.done()
+        release_cleanup.set()
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=1)
+
+        assert cleanup_was_pending
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+
+        assert staged_path is not None
+        assert not staged_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_after_acceptance_returns_success(
+        self, monkeypatch, tmp_path
+    ):
+        import shutil
+        import threading
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        image_path = tmp_path / "chart.png"
+        image_path.write_bytes(b"\x89PNG" + b"\x00" * 100)
+        loop = asyncio.get_running_loop()
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        release_cleanup = threading.Event()
+        real_rmtree = shutil.rmtree
+        rpc_calls = []
+        stage_root = None
+
+        def blocked_rmtree(*args, **kwargs):
+            loop.call_soon_threadsafe(cleanup_started.set)
+            release_cleanup.wait()
+            try:
+                return real_rmtree(*args, **kwargs)
+            finally:
+                loop.call_soon_threadsafe(cleanup_finished.set)
+
+        async def accepted_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal stage_root
+            rpc_calls.append(method)
+            stage_root = Path(params["attachments"][0]).parents[1]
+            return {"timestamp": 24680}
+
+        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        adapter._rpc = accepted_rpc
+        send_task = asyncio.create_task(
+            adapter.send_image_file(
+                chat_id="+155****4567", image_path=str(image_path)
+            )
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        send_task.cancel()
+        await asyncio.sleep(0)
+        send_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_was_pending = not send_task.done()
+        release_cleanup.set()
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=1)
+
+        assert cleanup_was_pending
+        result = await send_task
+
+        assert result.success is True
+        assert rpc_calls == ["send"]
+        assert 24680 in adapter._recent_sent_timestamps
+        assert stage_root is not None
+        assert not stage_root.exists()
+
+    @pytest.mark.asyncio
+    async def test_send_image_download_failure_stops_typing(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_image_from_url",
+            AsyncMock(side_effect=OSError("download failed")),
+        )
+
+        result = await adapter.send_image(
+            chat_id="+155****4567", image_url="https://example.test/chart.png"
+        )
+
+        assert result.success is False
+        adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
+
+    @pytest.mark.asyncio
+    async def test_send_image_missing_file_stops_typing(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send_image(
+            chat_id="+155****4567",
+            image_url=f"file://{tmp_path / 'missing.png'}",
+        )
+
+        assert result.success is False
+        adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
+
+    @pytest.mark.asyncio
+    async def test_send_image_oversize_stops_typing(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        image_path = tmp_path / "huge.png"
+        image_path.write_bytes(b"x")
+
+        def mock_stat(self, **kwargs):
+            class FakeStat:
+                st_size = 200 * 1024 * 1024
+
+            return FakeStat()
+
+        with patch.object(Path, "stat", mock_stat):
+            result = await adapter.send_image(
+                chat_id="+155****4567", image_url=f"file://{image_path}"
+            )
+
+        assert result.success is False
+        adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
 
     @pytest.mark.asyncio
     async def test_send_image_file_too_large(self, monkeypatch, tmp_path):
@@ -459,11 +762,49 @@ class TestSignalSendVoice:
 
         assert result.success is True
         assert captured[0]["method"] == "send"
-        assert captured[0]["params"]["attachments"] == [str(audio_path)]
+        sent_path = Path(captured[0]["params"]["attachments"][0])
+        assert sent_path.name == audio_path.name
+        assert "signal-outbox" in sent_path.parts
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
 
+    @pytest.mark.asyncio
+    async def test_send_voice_stages_file_in_shared_signal_outbox(
+        self, monkeypatch, tmp_path
+    ):
+        """Containerized signal-cli must receive a path in Hermes' shared outbox."""
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+
+        audio_path = tmp_path / "private" / "reply.ogg"
+        audio_path.parent.mkdir()
+        audio_bytes = b"OggS" + b"\x00" * 100
+        audio_path.write_bytes(audio_bytes)
+        staged_path = None
+
+        async def capture_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal staged_path
+            assert method == "send"
+            staged_path = Path(params["attachments"][0])
+            assert staged_path != audio_path
+            assert staged_path.is_relative_to(
+                hermes_home / "artifacts" / "signal-outbox"
+            )
+            assert staged_path.name == audio_path.name
+            assert staged_path.read_bytes() == audio_bytes
+            return {"timestamp": 1234567890}
+
+        adapter._rpc = capture_rpc
+        result = await adapter.send_voice(
+            chat_id="+155****4567", audio_path=str(audio_path)
+        )
+
+        assert result.success is True
+        assert staged_path is not None
+        assert not staged_path.exists()
 
     @pytest.mark.asyncio
     async def test_send_voice_too_large(self, monkeypatch, tmp_path):
@@ -506,7 +847,9 @@ class TestSignalSendVideo:
 
         assert result.success is True
         assert captured[0]["method"] == "send"
-        assert captured[0]["params"]["attachments"] == [str(vid_path)]
+        sent_path = Path(captured[0]["params"]["attachments"][0])
+        assert sent_path.name == vid_path.name
+        assert "signal-outbox" in sent_path.parts
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
@@ -1071,6 +1414,212 @@ class TestSignalSendMultipleImages:
         # raise_on_rate_limit must be opted into so the retry loop sees 429s
         assert captured[0]["kwargs"].get("raise_on_rate_limit") is True
 
+    @pytest.mark.asyncio
+    async def test_batch_stages_files_in_shared_signal_outbox(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        images = _make_image_files(tmp_path, 2)
+        staged_paths = []
+
+        async def capture_rpc(method, params, rpc_id=None, **kwargs):
+            staged_paths.extend(Path(p) for p in params["attachments"])
+            assert all(
+                p.is_relative_to(hermes_home / "artifacts" / "signal-outbox")
+                for p in staged_paths
+            )
+            assert all(p.exists() for p in staged_paths)
+            return {"timestamp": 1}
+
+        adapter._rpc = capture_rpc
+        await adapter.send_multiple_images(
+            chat_id="+155****4567", images=images
+        )
+
+        assert len(staged_paths) == 2
+        assert all(not p.exists() for p in staged_paths)
+
+    @pytest.mark.asyncio
+    async def test_staging_failure_logs_batch_and_continues(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        import shutil
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        images = _make_image_files(tmp_path, 2)
+        real_copyfile = shutil.copyfile
+        copy_attempt = 0
+
+        def fail_first_copy(source, target):
+            nonlocal copy_attempt
+            copy_attempt += 1
+            if copy_attempt == 1:
+                raise OSError("outbox unavailable")
+            return real_copyfile(source, target)
+
+        monkeypatch.setattr(
+            "gateway.platforms.signal.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 1
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.signal.shutil.copyfile", fail_first_copy
+        )
+        mock_rpc, captured = _stub_rpc_responses([{"timestamp": 2}])
+        adapter._rpc = mock_rpc
+
+        with caplog.at_level("ERROR", logger="gateway.platforms.signal"):
+            await adapter.send_multiple_images(
+                chat_id="+155****4567", images=images
+            )
+
+        assert len(captured) == 1
+        assert Path(captured[0]["params"]["attachments"][0]).name == "img_1.png"
+        assert "failed to stage batch 1/2" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_after_accepted_batch_does_not_retry(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        import shutil
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        real_rmtree = shutil.rmtree
+
+        def cleanup_then_fail(*args, **kwargs):
+            real_rmtree(*args, **kwargs)
+            raise OSError("cleanup failed")
+
+        monkeypatch.setattr(
+            "gateway.platforms.signal.shutil.rmtree", cleanup_then_fail
+        )
+        mock_rpc, captured = _stub_rpc_responses([{"timestamp": 1}])
+        adapter._rpc = mock_rpc
+
+        with caplog.at_level("WARNING", logger="gateway.platforms.signal"):
+            await adapter.send_multiple_images(
+                chat_id="+155****4567", images=_make_image_files(tmp_path, 1)
+            )
+
+        assert len(captured) == 1
+        assert "failed to clean staged attachments" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_rate_limit_cleanup_prevents_retry(
+        self, monkeypatch, tmp_path
+    ):
+        import shutil
+        import threading
+
+        from gateway.platforms.signal_rate_limit import SignalRateLimitError
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        loop = asyncio.get_running_loop()
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        release_cleanup = threading.Event()
+        real_rmtree = shutil.rmtree
+        rpc_calls = []
+
+        def blocked_rmtree(*args, **kwargs):
+            loop.call_soon_threadsafe(cleanup_started.set)
+            release_cleanup.wait()
+            try:
+                return real_rmtree(*args, **kwargs)
+            finally:
+                loop.call_soon_threadsafe(cleanup_finished.set)
+
+        async def rate_limited_rpc(method, params, rpc_id=None, **kwargs):
+            rpc_calls.append(method)
+            raise SignalRateLimitError("rate limited", retry_after=1)
+
+        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        adapter._rpc = rate_limited_rpc
+        send_task = asyncio.create_task(
+            adapter.send_multiple_images(
+                chat_id="+155****4567", images=_make_image_files(tmp_path, 1)
+            )
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        send_task.cancel()
+        await asyncio.sleep(0)
+        send_task.cancel()
+        release_cleanup.set()
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=1)
+
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+        assert rpc_calls == ["send"]
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_after_accepted_batch_keeps_bookkeeping(
+        self, monkeypatch, tmp_path
+    ):
+        import shutil
+        import threading
+
+        from gateway.platforms.signal_rate_limit import get_scheduler
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        scheduler = get_scheduler()
+        report_rpc_duration = AsyncMock()
+        monkeypatch.setattr(scheduler, "report_rpc_duration", report_rpc_duration)
+
+        loop = asyncio.get_running_loop()
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        release_cleanup = threading.Event()
+        real_rmtree = shutil.rmtree
+        rpc_calls = []
+        stage_root = None
+
+        def blocked_rmtree(*args, **kwargs):
+            loop.call_soon_threadsafe(cleanup_started.set)
+            release_cleanup.wait()
+            try:
+                return real_rmtree(*args, **kwargs)
+            finally:
+                loop.call_soon_threadsafe(cleanup_finished.set)
+
+        async def accepted_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal stage_root
+            rpc_calls.append(method)
+            stage_root = Path(params["attachments"][0]).parents[1]
+            return {"timestamp": 13579}
+
+        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        adapter._rpc = accepted_rpc
+        send_task = asyncio.create_task(
+            adapter.send_multiple_images(
+                chat_id="+155****4567", images=_make_image_files(tmp_path, 1)
+            )
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        send_task.cancel()
+        await asyncio.sleep(0)
+        send_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_was_pending = not send_task.done()
+        release_cleanup.set()
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=1)
+
+        assert cleanup_was_pending
+        await send_task
+
+        assert rpc_calls == ["send"]
+        assert 13579 in adapter._recent_sent_timestamps
+        report_rpc_duration.assert_awaited_once()
+        assert stage_root is not None
+        assert not stage_root.exists()
 
     @pytest.mark.asyncio
     async def test_429_without_retry_after_uses_default_rate(
