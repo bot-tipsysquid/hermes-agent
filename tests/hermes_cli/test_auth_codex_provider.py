@@ -512,6 +512,23 @@ def _patch_httpx(monkeypatch, response):
 
 
 
+def test_refresh_success_returns_rotated_tokens(monkeypatch):
+    """A successful Codex refresh returns the rotated token payload."""
+    response = _StubHTTPResponse(
+        200,
+        {"access_token": "new-access", "refresh_token": "new-refresh"},
+    )
+    _patch_httpx(monkeypatch, response)
+
+    refreshed = refresh_codex_oauth_pure("old-access", "old-refresh")
+
+    assert refreshed["access_token"] == "new-access"
+    assert refreshed["refresh_token"] == "new-refresh"
+    assert refreshed["last_refresh"].endswith("Z")
+
+
+
+
 def test_refresh_429_classified_as_quota_not_auth_failure(monkeypatch):
     """429 from the token endpoint is a usage-quota cap, not an auth failure.
 
