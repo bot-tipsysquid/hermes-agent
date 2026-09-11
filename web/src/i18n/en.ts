@@ -418,6 +418,21 @@ export const en: Translations = {
     versionBadge: "Version",
     showInSidebar: "Show in sidebar",
     hideFromSidebar: "Hide from sidebar",
+    catalogHeading: "Plugin catalog",
+    catalogHint:
+      "Curated, Nous-reviewed plugins pinned to exact commits. Install from here for supply-chain-safe versions.",
+    catalogSearchPlaceholder: "Search catalog...",
+    catalogEmpty: "No catalog entries match.",
+    catalogEmptyDocsLink: "Learn about Hermes plugins",
+    catalogInstallBtn: "Install",
+    catalogInstalledBadge: "Installed ✓",
+    catalogUpdateBtn: "Update available",
+    catalogRemovedBadge: "Removed",
+    catalogConfirmTitle: "Install this plugin?",
+    catalogConfirmInstallNote:
+      "Plugins install disabled; enable it after install to activate.",
+    catalogRequiresEnv: "Requires env",
+    removedFromCatalog: "Removed from catalog",
   },
 
   skills: {
@@ -534,6 +549,8 @@ export const en: Translations = {
     copyCliCommand: "Copy CLI command (for external / fallback)",
     connect: "Connect",
     sessionExpires: "Session expires in {time}",
+    sessionExpiredNoError:
+      "Sign-in expired without reaching the provider. This usually means the sign-in page stalled in the opened tab (server-side issue) — finish signing in there, then click Retry. If it keeps failing, use an API key or the CLI fallback instead.",
     initiatingLogin: "Initiating login flow…",
     exchangingCode: "Exchanging code for tokens…",
     connectedClosing: "Connected! Closing…",
@@ -827,6 +844,12 @@ export const en: Translations = {
       "Mark this task as blocked? The worker's claim is released.",
     confirmScheduled:
       "Move this task to Scheduled? Use this for known time delays rather than human blockers.",
+    confirmDoneMany:
+      "Mark {n} tasks as done? The workers' claims are released and dependent children become ready.",
+    confirmArchiveMany:
+      "Archive {n} tasks? They disappear from the default board view.",
+    confirmBlockedMany:
+      "Mark {n} tasks as blocked? The workers' claims are released.",
     completionSummary:
       "Completion summary for {label}. This is stored as the task result.",
     completionSummaryRequired:
@@ -864,5 +887,9 @@ export const en: Translations = {
       "Comments reach the worker on its next run or kanban_show() — no need to block the task first.",
     commentHintTitle:
       "Comments are the channel for talking to a task's worker. They land on the thread immediately — no need to block the task first. A running worker picks the thread up on its next kanban_show() or respawn; blocking is only for when you want the worker to STOP and wait for your input.",
+    trash: {
+      confirmTitle: "Delete task?",
+      confirmManyTitle: "Delete {n} tasks?",
+    },
   },
 };

@@ -1,36 +1,9 @@
 """Tests for Telegram model picker thread fallback."""
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-
-def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
-
-    mod = MagicMock()
-    mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    mod.constants.ParseMode.MARKDOWN = "Markdown"
-    mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    mod.constants.ParseMode.HTML = "HTML"
-    mod.constants.ChatType.PRIVATE = "private"
-    mod.constants.ChatType.GROUP = "group"
-    mod.constants.ChatType.SUPERGROUP = "supergroup"
-    mod.constants.ChatType.CHANNEL = "channel"
-    mod.error.NetworkError = type("NetworkError", (OSError,), {})
-    mod.error.TimedOut = type("TimedOut", (OSError,), {})
-    mod.error.BadRequest = type("BadRequest", (Exception,), {})
-
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, mod)
-    sys.modules.setdefault("telegram.error", mod.error)
-
-
-_ensure_telegram_mock()
-
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -43,37 +16,27 @@ def _make_adapter():
 
 
 def test_picker_provider_list_keeps_current_provider_before_moa(monkeypatch):
-    """The virtual MoA row must not displace the active provider on Telegram.
+    """The virtual MoA row must not displace Telegram's active provider."""
+    from hermes_cli import inventory, model_switch_providers
 
-    The Telegram picker renders providers in the order returned by
-    list_picker_providers(). If MoA is blindly prepended, the first tap after
-    `/model` is no longer the current provider, making the common "change model
-    within my current provider" flow needlessly awkward.
-    """
-    from hermes_cli import inventory, model_switch
-
-    monkeypatch.setattr(
-        model_switch,
-        "list_authenticated_providers",
-        lambda **_kwargs: [
-            {
-                "slug": "openai-codex",
-                "name": "OpenAI Codex",
-                "is_current": True,
-                "models": ["gpt-5.5"],
-                "total_models": 1,
-            },
-            {
-                "slug": "custom:api.venice.ai",
-                "name": "api.venice.ai",
-                "is_current": False,
-                "is_user_defined": True,
-                "api_url": "https://api.venice.ai/api/v1",
-                "models": ["qwen3-coder"],
-                "total_models": 1,
-            },
-        ],
-    )
+    providers = [
+        {
+            "slug": "openai-codex",
+            "name": "OpenAI Codex",
+            "is_current": True,
+            "models": ["gpt-5.5"],
+            "total_models": 1,
+        },
+        {
+            "slug": "custom:api.venice.ai",
+            "name": "api.venice.ai",
+            "is_current": False,
+            "is_user_defined": True,
+            "api_url": "https://api.venice.ai/api/v1",
+            "models": ["qwen3-coder"],
+            "total_models": 1,
+        },
+    ]
     monkeypatch.setattr(
         inventory,
         "_moa_provider_row",
@@ -86,12 +49,10 @@ def test_picker_provider_list_keeps_current_provider_before_moa(monkeypatch):
         },
     )
 
-    providers = model_switch.list_picker_providers(
-        current_provider="openai-codex",
-        include_moa=True,
-    )
+    prioritized = model_switch_providers._prepend_moa_picker_provider(
+        providers, current_provider="openai-codex")
 
-    assert [p["slug"] for p in providers[:2]] == ["openai-codex", "moa"]
+    assert [p["slug"] for p in prioritized[:2]] == ["openai-codex", "moa"]
 
 
 class TestTelegramModelPicker:

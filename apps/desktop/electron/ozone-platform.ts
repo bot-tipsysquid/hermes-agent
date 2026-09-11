@@ -19,22 +19,17 @@ export function resolveOzonePlatformSwitch({
     return null
   }
 
-  const explicit = String(env.HERMES_DESKTOP_OZONE_PLATFORM || '').trim()
+  // The current CLI bridges desktop.ozone_platform_hint into
+  // ELECTRON_OZONE_PLATFORM_HINT. Keep the legacy override as a lower-priority
+  // compatibility path for existing downstream installations.
+  const explicit = String(
+    env.ELECTRON_OZONE_PLATFORM_HINT || env.HERMES_DESKTOP_OZONE_PLATFORM || ''
+  ).trim()
+
   if (explicit) {
     // `auto` is the opt-out: let Chromium/Electron choose its native default.
     return explicit.toLowerCase() === 'auto' ? null : explicit
   }
 
-  if (String(env.XDG_SESSION_TYPE || '').toLowerCase() !== 'wayland') {
-    return null
-  }
-
-  if (!env.DISPLAY) {
-    return null
-  }
-
-  // Fedora/GNOME Wayland on ARM has been observed to keep the BrowserWindow
-  // alive but unmapped/invisible even after show(). XWayland is already present
-  // when DISPLAY exists, and it gives Electron a normal visible toplevel.
-  return 'x11'
+  return null
 }

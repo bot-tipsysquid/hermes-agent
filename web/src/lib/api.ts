@@ -79,6 +79,10 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/messaging/platforms",
   "/api/messaging/telegram/onboarding",
   "/api/messaging/whatsapp/onboarding",
+  // OAuth/account state is profile-owned too: status, login sessions, polling,
+  // cancellation, and disconnect must all follow the selected management
+  // profile rather than silently targeting the dashboard process's profile.
+  "/api/providers/oauth",
   "/api/model/info",
   "/api/model/set",
   "/api/model/auxiliary",
@@ -452,11 +456,18 @@ export const api = {
     source?: string,
     profile = getManagementProfile(),
   ) =>
-    fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ older_than_days, source, profile: profile || undefined }),
-    }),
+    fetchJSON<{ ok: boolean; removed: number; skipped_open: number }>(
+      "/api/sessions/prune",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          older_than_days,
+          source,
+          profile: profile || undefined,
+        }),
+      },
+    ),
   listFiles: (path?: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
     return fetchJSON<ManagedFilesResponse>(`/api/files${query}`);
@@ -963,6 +974,9 @@ export const api = {
     fetchJSON<{ ok: boolean; count: number }>("/api/dashboard/plugins/rescan"),
 
   getPluginsHub: () => fetchJSON<PluginsHubResponse>("/api/dashboard/plugins/hub"),
+
+  getPluginsCatalog: () =>
+    fetchJSON<CatalogResponse>("/api/dashboard/plugins/catalog"),
 
   installAgentPlugin: (body: AgentPluginInstallRequest) =>
     fetchJSON<AgentPluginInstallResponse>("/api/dashboard/agent-plugins/install", {
@@ -1861,11 +1875,13 @@ export interface StatusResponse {
    * fail-closed state (the dashboard will refuse to bind). */
   auth_providers?: string[];
   /** Supported dashboard auth flows for the client to choose from. In gated
-   * mode always includes ``"cookie"``; includes ``"native_pkce"`` when a
-   * brokerable OAuth provider is registered, signalling that the desktop can
-   * use the RFC 8252 system-browser + loopback + PKCE flow (no embedded
-   * webview, no session cookies). Absent / missing ``"native_pkce"`` ⇒ an
-   * older gateway ⇒ the desktop falls back to the embedded-webview flow. */
+   * mode always includes ``"cookie"``; includes ``"native_pkce"`` when any
+   * interactive session provider is registered (OAuth providers broker the
+   * IDP redirect; password providers complete at /login in the system
+   * browser), signalling that the desktop can use the RFC 8252
+   * system-browser + loopback + PKCE flow (no embedded webview, no session
+   * cookies). Absent / missing ``"native_pkce"`` ⇒ an older gateway ⇒ the
+   * desktop falls back to the embedded-webview flow. */
   auth_flows?: string[];
   /** False when the dashboard is running in a hosted/managed layout where
    * updates are handled by the outer launcher instead of ``hermes update``. */
@@ -1935,6 +1951,9 @@ export interface SessionInfo {
   output_tokens: number;
   preview: string | null;
   parent_session_id?: string | null;
+  /** Owning profile stamped by the list/detail endpoints (the store the row
+   * was read from). Absent on search-endpoint rows, which carry no stamp. */
+  profile?: string;
 }
 
 export interface SessionLatestDescendantResponse {
@@ -2171,6 +2190,7 @@ export interface ProfileInfo {
   gateway_running: boolean;
   description: string;
   description_auto: boolean;
+  display_name?: string;
   distribution_name: string | null;
   distribution_version: string | null;
   distribution_source: string | null;
@@ -2266,6 +2286,7 @@ export interface CronJob {
   last_status?: string | null;
   last_error?: string | null;
   last_delivery_error?: string | null;
+  last_fire_error?: { at?: string | null; detail?: string | null } | null;
 }
 
 export interface CronDeliveryTarget {
@@ -2442,9 +2463,7 @@ export interface MoaConfigResponse {
     aggregator_temperature: number;
     reference_timeout: number | null;
     degraded_reference_policy: "loud" | "silent";
-    max_tokens: number;
-    /** Optional advisor output cap — round-tripped, not edited here. */
-    reference_max_tokens?: number | null;
+
     /** Fan-out cadence (user_turn default | per_iteration | every_n:N) — round-tripped. */
     fanout?: string;
     enabled: boolean;
@@ -2455,7 +2474,7 @@ export interface MoaConfigResponse {
   aggregator_temperature: number;
   reference_timeout: number | null;
   degraded_reference_policy: "loud" | "silent";
-  max_tokens: number;
+
   enabled: boolean;
 }
 
@@ -2607,6 +2626,8 @@ export interface HubAgentPluginRow {
   auth_required: boolean;
   auth_command: string;
   user_hidden: boolean;
+  /** Reason string when this plugin is on the catalog removed blocklist. */
+  removed_reason?: string | null;
 }
 
 export interface PluginsHubProviders {
@@ -2626,6 +2647,8 @@ export interface AgentPluginInstallRequest {
   identifier: string;
   force?: boolean;
   enable?: boolean;
+  /** Install by curated-catalog name (resolves repo + pinned SHA server-side). */
+  catalog_name?: string;
 }
 
 export interface AgentPluginInstallResponse {
@@ -2636,6 +2659,48 @@ export interface AgentPluginInstallResponse {
   after_install_path?: string | null;
   enabled?: boolean;
   error?: string;
+}
+
+// ── Plugin catalog types ───────────────────────────────────────────────
+
+export interface CatalogCapabilities {
+  provides_tools: string[];
+  provides_hooks: string[];
+  provides_middleware: string[];
+  requires_env: string[];
+}
+
+export interface CatalogEntry {
+  name: string;
+  description: string;
+  repo: string;
+  sha: string;
+  sha_short: string;
+  tier: "official" | "community";
+  maintainer: string;
+  requires_hermes: string;
+  platforms: string[];
+  capabilities: CatalogCapabilities;
+  docs_url: string;
+  capability_summary: string;
+  /** Installed-state merge (computed server-side). */
+  installed: boolean;
+  installed_sha: string | null;
+  update_available: boolean;
+  runtime_status: "disabled" | "enabled" | "inactive" | null;
+}
+
+export interface CatalogRemovedEntry {
+  name: string;
+  repo: string;
+  reason: string;
+  date: string;
+}
+
+export interface CatalogResponse {
+  entries: CatalogEntry[];
+  removed: CatalogRemovedEntry[];
+  generated_at: string;
 }
 
 export interface AgentPluginUpdateResponse {
