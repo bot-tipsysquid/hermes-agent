@@ -45,6 +45,12 @@ class _ToolboxRunner:
                 stdout=f"fedora\n{self.container_release}\n",
                 stderr="",
             )
+        if argv[-2:-1] == ("-lc",) and "rpm -q --whatprovides --quiet" in argv[-1]:
+            return SimpleNamespace(
+                returncode=0 if self.packages_installed else 1,
+                stdout="",
+                stderr="",
+            )
         if "rpm" in argv and "--quiet" in argv:
             return SimpleNamespace(
                 returncode=0 if self.packages_installed else 1,
@@ -103,6 +109,27 @@ def test_existing_verified_toolbox_is_idempotent(tmp_path):
 
     assert not _commands_with(runner, "create")
     assert not _commands_with(runner, "dnf")
+
+
+def test_package_verification_accepts_virtual_capability_providers(tmp_path):
+    runner = _ToolboxRunner(container_exists=True, packages_installed=True)
+
+    ensure_desktop_toolbox(
+        runner=runner,
+        project_root=tmp_path,
+        host_release="44",
+        toolbox_executable="toolbox",
+    )
+
+    provider_probes = [
+        command[-1]
+        for command in runner.commands
+        if command[-2:-1] == ("-lc",) and "rpm -q --whatprovides --quiet" in command[-1]
+    ]
+    assert len(provider_probes) == 1
+    for capability in REQUIRED_PACKAGES:
+        assert f"rpm -q --whatprovides --quiet {capability}" in provider_probes[0]
+    assert not any(command[4:7] == ("rpm", "-q", "--quiet") for command in runner.commands)
 
 
 def test_wrong_release_toolbox_fails_closed_without_installing_packages(tmp_path):

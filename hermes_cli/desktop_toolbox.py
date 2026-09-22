@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 from typing import Any, Callable, Protocol, Sequence
@@ -20,6 +21,10 @@ REQUIRED_PACKAGES = (
 )
 _REQUIRED_COMMANDS = ("make", "gcc", "g++", "python3", "node", "npm", "pkg-config")
 _RELEASE_PROBE = ". /etc/os-release; printf '%s\\n%s\\n' \"$ID\" \"$VERSION_ID\""
+_PACKAGE_PROBE = " && ".join(
+    f"rpm -q --whatprovides --quiet {shlex.quote(package)} >/dev/null"
+    for package in REQUIRED_PACKAGES
+)
 _COMMAND_PROBE = " && ".join(f"command -v {command} >/dev/null" for command in _REQUIRED_COMMANDS)
 
 
@@ -156,7 +161,7 @@ def ensure_desktop_toolbox(
             f"Toolbx '{TOOLBOX_NAME}' uses Fedora release {actual}; host release {release} is required"
         )
 
-    package_probe = _inside(toolbox, "rpm", "-q", "--quiet", *REQUIRED_PACKAGES)
+    package_probe = _inside(toolbox, "sh", "-lc", _PACKAGE_PROBE)
     packages = _run(command_runner, package_probe, timeout=60)
     if packages.returncode != 0:
         if not allow_provision:
