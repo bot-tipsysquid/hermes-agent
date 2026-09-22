@@ -16,12 +16,41 @@ _X86_64 = 62
 
 def _write_elf(path: Path, machine: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = bytearray(64)
-    header[:4] = b"\x7fELF"
-    header[4] = 2  # ELFCLASS64
-    header[5] = 1  # little endian
-    header[18:20] = struct.pack("<H", machine)
-    path.write_bytes(header)
+    ident = bytearray(16)
+    ident[:4] = b"\x7fELF"
+    ident[4] = 2  # ELFCLASS64
+    ident[5] = 1  # little endian
+    ident[6] = 1  # current ELF version
+    file_size = 64 + 56
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        bytes(ident),
+        3,  # ET_DYN (Electron and native modules are PIE/shared objects)
+        machine,
+        1,
+        0,
+        64,
+        0,
+        0,
+        64,
+        56,
+        1,
+        0,
+        0,
+        0,
+    )
+    load_segment = struct.pack(
+        "<IIQQQQQQ",
+        1,  # PT_LOAD
+        5,
+        0,
+        0,
+        0,
+        file_size,
+        file_size,
+        0x1000,
+    )
+    path.write_bytes(header + load_segment)
 
 
 @pytest.fixture
@@ -88,6 +117,30 @@ def test_missing_packaged_node_pty_fails_closed(arm64_bundle):
         verify.verify_arm64_update_artifacts(root)
 
 
+def test_truncated_elf64_header_fails_closed(tmp_path):
+    artifact = tmp_path / "truncated"
+    artifact.write_bytes(b"\x7fELF\x02\x01" + bytes(14))
+
+    with pytest.raises(verify.ArtifactVerificationError, match="truncated|header"):
+        verify._elf_machine(artifact)
+
+
+@pytest.mark.parametrize("corruption", ["program-table", "load-segment"])
+def test_out_of_bounds_elf64_structure_fails_closed(tmp_path, corruption):
+    artifact = tmp_path / corruption
+    _write_elf(artifact, _AARCH64)
+    payload = bytearray(artifact.read_bytes())
+    if corruption == "program-table":
+        payload[32:40] = struct.pack("<Q", len(payload) + 1)
+    else:
+        # First program header p_filesz (offset 32 inside Elf64_Phdr).
+        payload[64 + 32 : 64 + 40] = struct.pack("<Q", len(payload) + 1)
+    artifact.write_bytes(payload)
+
+    with pytest.raises(verify.ArtifactVerificationError, match="bounds|outside|truncated"):
+        verify._elf_machine(artifact)
+
+
 def test_gateway_receipt_requires_expected_revision_and_connected_platform(tmp_path):
     state = tmp_path / "gateway_state.json"
     state.write_text(
@@ -97,7 +150,13 @@ def test_gateway_receipt_requires_expected_revision_and_connected_platform(tmp_p
         encoding="utf-8",
     )
 
-    verify.verify_gateway_ready("abc123", state_path=state, attempts=1, interval=0)
+    verify.verify_gateway_ready(
+        "abc123",
+        state_path=state,
+        attempts=1,
+        interval=0,
+        process_start_time=lambda pid: 11 if pid == 7 else None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -130,4 +189,55 @@ def test_gateway_receipt_fails_closed_without_current_platform_ready_marker(
     state.write_text(payload, encoding="utf-8")
 
     with pytest.raises(verify.GatewayVerificationError, match=message):
-        verify.verify_gateway_ready("abc123", state_path=state, attempts=1, interval=0)
+        verify.verify_gateway_ready(
+            "abc123",
+            state_path=state,
+            attempts=1,
+            interval=0,
+            process_start_time=lambda pid: 11 if pid == 7 else None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("live_start", "message"),
+    [
+        (None, "not alive|live process"),
+        (99999, "identity|start time"),
+    ],
+)
+def test_gateway_receipt_rejects_dead_or_reused_pid(tmp_path, live_start, message):
+    state = tmp_path / "gateway_state.json"
+    state.write_text(
+        '{"gateway_state":"running","code_sha":"abc123","pid":7,"start_time":11,'
+        '"platforms":{"telegram":{"state":"connected","writer_pid":7,'
+        '"writer_start_time":11}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(verify.GatewayVerificationError, match=message):
+        verify.verify_gateway_ready(
+            "abc123",
+            state_path=state,
+            attempts=1,
+            interval=0,
+            process_start_time=lambda _pid: live_start,
+        )
+
+
+def test_gateway_receipt_rejects_platform_writer_from_other_incarnation(tmp_path):
+    state = tmp_path / "gateway_state.json"
+    state.write_text(
+        '{"gateway_state":"running","code_sha":"abc123","pid":7,"start_time":11,'
+        '"platforms":{"telegram":{"state":"connected","writer_pid":7,'
+        '"writer_start_time":99999}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(verify.GatewayVerificationError, match="platform-ready|writer"):
+        verify.verify_gateway_ready(
+            "abc123",
+            state_path=state,
+            attempts=1,
+            interval=0,
+            process_start_time=lambda _pid: 11,
+        )

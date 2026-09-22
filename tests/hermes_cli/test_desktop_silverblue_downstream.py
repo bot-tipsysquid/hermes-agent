@@ -85,7 +85,9 @@ def test_toolbox_probe_provisions_named_hermes_container(monkeypatch):
 
     assert main_desktop._desktop_toolbox_build_container() == "hermes-arm-build"
     assert captured["toolbox_executable"] == "/usr/bin/toolbox"
-    assert captured["project_root"].name == "tmm-241-silverblue-updater"
+    from hermes_cli.main import PROJECT_ROOT
+
+    assert captured["project_root"] == PROJECT_ROOT
 
 
 def test_desktop_dependency_install_uses_toolbox_prefix(monkeypatch, tmp_path):

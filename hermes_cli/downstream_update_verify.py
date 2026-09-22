@@ -37,20 +37,118 @@ class ArtifactReceipt:
 
 
 def _elf_machine(path: Path) -> int:
+    """Validate a bounded, structurally plausible ELF64 image and return e_machine."""
     try:
+        file_size = path.stat().st_size
         with path.open("rb") as stream:
-            header = stream.read(20)
-    except OSError as exc:
-        raise ArtifactVerificationError(f"cannot read packaged artifact {path}: {exc}") from exc
-    if len(header) < 20 or header[:4] != b"\x7fELF" or header[4] != 2:
-        raise ArtifactVerificationError(f"packaged artifact is not a 64-bit ELF file: {path}")
-    if header[5] == 1:
-        order = "<"
-    elif header[5] == 2:
-        order = ">"
-    else:
-        raise ArtifactVerificationError(f"packaged ELF has an invalid byte order: {path}")
-    return struct.unpack(f"{order}H", header[18:20])[0]
+            header = stream.read(64)
+            if len(header) != 64:
+                raise ArtifactVerificationError(
+                    f"packaged ELF header is truncated: {path}"
+                )
+            ident = header[:16]
+            if ident[:4] != b"\x7fELF" or ident[4] != 2:
+                raise ArtifactVerificationError(
+                    f"packaged artifact is not a 64-bit ELF file: {path}"
+                )
+            if ident[5] == 1:
+                order = "<"
+            elif ident[5] == 2:
+                order = ">"
+            else:
+                raise ArtifactVerificationError(
+                    f"packaged ELF has an invalid byte order: {path}"
+                )
+            if ident[6] != 1:
+                raise ArtifactVerificationError(
+                    f"packaged ELF has an invalid identification version: {path}"
+                )
+            (
+                _ident,
+                file_type,
+                machine,
+                version,
+                _entry,
+                program_offset,
+                section_offset,
+                _flags,
+                header_size,
+                program_entry_size,
+                program_count,
+                section_entry_size,
+                section_count,
+                section_names_index,
+            ) = struct.unpack(f"{order}16sHHIQQQIHHHHHH", header)
+            if file_type not in {2, 3} or version != 1 or header_size != 64:
+                raise ArtifactVerificationError(
+                    f"packaged ELF has an invalid complete header: {path}"
+                )
+            if program_count <= 0 or program_entry_size != 56:
+                raise ArtifactVerificationError(
+                    f"packaged ELF has an invalid program header table: {path}"
+                )
+            program_end = program_offset + program_entry_size * program_count
+            if program_offset < header_size or program_end > file_size:
+                raise ArtifactVerificationError(
+                    f"packaged ELF program header table is outside file bounds: {path}"
+                )
+            if section_count:
+                section_end = section_offset + section_entry_size * section_count
+                if (
+                    section_offset < header_size
+                    or section_entry_size != 64
+                    or section_end > file_size
+                    or section_names_index >= section_count
+                ):
+                    raise ArtifactVerificationError(
+                        f"packaged ELF section header table is outside file bounds: {path}"
+                    )
+            elif section_offset != 0 or section_names_index != 0:
+                raise ArtifactVerificationError(
+                    f"packaged ELF has inconsistent section structure: {path}"
+                )
+
+            has_load_segment = False
+            for index in range(program_count):
+                stream.seek(program_offset + index * program_entry_size)
+                raw_program = stream.read(program_entry_size)
+                if len(raw_program) != program_entry_size:
+                    raise ArtifactVerificationError(
+                        f"packaged ELF program header is truncated: {path}"
+                    )
+                (
+                    segment_type,
+                    _segment_flags,
+                    segment_offset,
+                    _virtual_address,
+                    _physical_address,
+                    file_bytes,
+                    memory_bytes,
+                    alignment,
+                ) = struct.unpack(f"{order}IIQQQQQQ", raw_program)
+                if segment_offset > file_size or file_bytes > file_size - segment_offset:
+                    raise ArtifactVerificationError(
+                        f"packaged ELF segment extends outside file bounds: {path}"
+                    )
+                if memory_bytes < file_bytes:
+                    raise ArtifactVerificationError(
+                        f"packaged ELF segment has invalid memory bounds: {path}"
+                    )
+                if alignment not in {0, 1} and alignment & (alignment - 1):
+                    raise ArtifactVerificationError(
+                        f"packaged ELF segment has invalid alignment: {path}"
+                    )
+                if segment_type == 1:
+                    has_load_segment = True
+            if not has_load_segment:
+                raise ArtifactVerificationError(
+                    f"packaged ELF has no loadable segment: {path}"
+                )
+            return machine
+    except ArtifactVerificationError:
+        raise
+    except (OSError, struct.error) as exc:
+        raise ArtifactVerificationError(f"cannot validate packaged ELF {path}: {exc}") from exc
 
 
 def _require_aarch64(path: Path, label: str) -> None:
@@ -103,7 +201,13 @@ def _platform_ready(value: object, *, pid: object, start_time: object) -> bool:
     )
 
 
-def _gateway_receipt_error(payload: object, expected_sha: str) -> str | None:
+def _gateway_receipt_error(
+    payload: object,
+    expected_sha: str,
+    *,
+    process_start_time: Callable[[int], int | None],
+    start_times_match: Callable[[object, object], bool],
+) -> str | None:
     if not isinstance(payload, dict):
         return "gateway runtime receipt is not an object"
     receipt = cast(dict[str, object], payload)
@@ -112,15 +216,36 @@ def _gateway_receipt_error(payload: object, expected_sha: str) -> str | None:
     if receipt.get("gateway_state") not in _READY_GATEWAY_STATES:
         return "gateway runtime receipt is not running"
     pid = receipt.get("pid")
-    start_time = receipt.get("start_time")
-    if pid is None or start_time is None:
-        return "gateway runtime receipt has no process identity"
+    recorded_start = receipt.get("start_time")
+    if not isinstance(pid, int) or pid <= 0 or recorded_start is None:
+        return "gateway runtime receipt has no valid process identity"
+    live_start = process_start_time(pid)
+    if live_start is None:
+        return "gateway process is not alive or its live process identity is unavailable"
+    try:
+        if not start_times_match(recorded_start, live_start):
+            return "gateway process identity does not match the recorded start time"
+    except (TypeError, ValueError, OverflowError):
+        return "gateway runtime receipt has a malformed process start time"
     platforms = receipt.get("platforms")
     if not isinstance(platforms, dict) or not any(
-        _platform_ready(value, pid=pid, start_time=start_time) for value in platforms.values()
+        _platform_ready(value, pid=pid, start_time=recorded_start)
+        for value in platforms.values()
     ):
-        return "gateway platform-ready marker is missing"
+        return "gateway platform-ready writer identity is missing or stale"
     return None
+
+
+def _default_process_start_time(pid: int) -> int | None:
+    from gateway.status import get_process_start_time
+
+    return get_process_start_time(pid)
+
+
+def _default_start_times_match(recorded: object, current: object) -> bool:
+    from gateway.status import start_time_fingerprints_match
+
+    return start_time_fingerprints_match(recorded, current)
 
 
 def verify_gateway_ready(
@@ -130,8 +255,10 @@ def verify_gateway_ready(
     attempts: int = 12,
     interval: float = 5.0,
     sleep: Callable[[float], None] = time.sleep,
+    process_start_time: Callable[[int], int | None] = _default_process_start_time,
+    start_times_match: Callable[[object, object], bool] = _default_start_times_match,
 ) -> None:
-    """Poll the runtime receipt for the intended revision and a ready platform."""
+    """Poll for the intended revision, live process identity, and a ready platform."""
     if state_path is None:
         from hermes_constants import get_hermes_home
 
@@ -145,7 +272,15 @@ def verify_gateway_ready(
         except (OSError, json.JSONDecodeError) as exc:
             last_error = f"gateway runtime receipt is unreadable: {exc}"
         else:
-            last_error = _gateway_receipt_error(payload, expected_sha) or ""
+            last_error = (
+                _gateway_receipt_error(
+                    payload,
+                    expected_sha,
+                    process_start_time=process_start_time,
+                    start_times_match=start_times_match,
+                )
+                or ""
+            )
             if not last_error:
                 return
         if attempt + 1 < max(1, attempts):

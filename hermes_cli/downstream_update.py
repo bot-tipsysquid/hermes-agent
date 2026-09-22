@@ -8,18 +8,23 @@ injectable runner boundary so unit tests never fetch, merge, push, or restart.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import platform
+import socket
 import subprocess
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, ContextManager, Sequence
 from urllib.parse import urlsplit
 
 from hermes_cli.desktop_toolbox import (
     CommandRunner,
     SubprocessRunner,
+    TOOLBOX_NAME,
     ensure_desktop_toolbox,
+    fedora_release,
     toolbox_npm_command,
 )
 
@@ -27,6 +32,10 @@ from hermes_cli.desktop_toolbox import (
 _LIVE_BRANCH = "ken/downstream"
 _UPSTREAM_SLUG = "NousResearch/hermes-agent"
 _FORK_SLUG = "bot-tipsysquid/hermes-agent"
+_ONECLI_HOST = "127.0.0.1"
+_ONECLI_PORT = 10254
+
+
 class DownstreamUpdateError(RuntimeError):
     """Raised when any update gate cannot prove the transaction safe."""
 
@@ -51,6 +60,13 @@ class UpdateConfig:
 ProvisionToolbox = Callable[..., str]
 ArtifactVerifier = Callable[[CommandRunner, Path], None]
 GatewayVerifier = Callable[[CommandRunner, str], None]
+HostPreflight = Callable[
+    [CommandRunner, UpdateConfig, ProvisionToolbox, Callable[[str], None]], str
+]
+TransactionLock = Callable[[UpdateConfig], ContextManager[object]]
+ConfigVerifier = Callable[[CommandRunner, UpdateConfig], None]
+RuntimeIdentityVerifier = Callable[[CommandRunner, UpdateConfig, str], None]
+OneCLIServiceReady = Callable[[UpdateConfig], bool]
 
 
 def checkout_root() -> Path:
@@ -132,17 +148,46 @@ def _require_clean(runner: CommandRunner, repo: Path) -> None:
 
 
 def _remote_slug(url: str) -> str | None:
-    value = url.strip()
-    if value.startswith("git@github.com:"):
-        path = value.removeprefix("git@github.com:")
+    """Return a slug only for the three reviewed canonical GitHub transports."""
+    if not isinstance(url, str) or url != url.strip():
+        return None
+    if url.startswith("git@github.com:"):
+        path = url.removeprefix("git@github.com:")
     else:
-        parsed = urlsplit(value)
-        if (parsed.hostname or "").casefold() != "github.com":
+        try:
+            parsed = urlsplit(url)
+            _ = parsed.port  # malformed ports raise ValueError
+        except ValueError:
             return None
-        path = parsed.path.lstrip("/")
-    path = path.removesuffix("/").removesuffix(".git")
-    parts = path.split("/")
+        if parsed.scheme == "https":
+            if (
+                parsed.netloc != "github.com"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.port is not None
+            ):
+                return None
+        elif parsed.scheme == "ssh":
+            if (
+                parsed.netloc != "git@github.com"
+                or parsed.username != "git"
+                or parsed.password is not None
+                or parsed.hostname != "github.com"
+                or parsed.port is not None
+            ):
+                return None
+        else:
+            return None
+        if parsed.query or parsed.fragment:
+            return None
+        path = parsed.path.removeprefix("/")
+    if not path.endswith(".git"):
+        return None
+    repository = path.removesuffix(".git")
+    parts = repository.split("/")
     if len(parts) != 2 or not all(parts):
+        return None
+    if any(part in {".", ".."} or any(character.isspace() for character in part) for part in parts):
         return None
     return f"{parts[0]}/{parts[1]}"
 
@@ -168,23 +213,105 @@ def _require_remote(
         )
     )
     urls = [line for line in url.splitlines() if line.strip()]
-    if len(urls) != 1 or (_remote_slug(urls[0]) or "").casefold() != expected_slug.casefold():
+    if len(urls) != 1 or _remote_slug(urls[0]) != expected_slug:
         kind = "push URL" if push else "URL"
         raise DownstreamUpdateError(
             f"remote {remote} has wrong {kind}; expected GitHub {expected_slug}"
         )
 
 
+def _os_release_values(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise DownstreamUpdateError(f"cannot read host OS metadata: {exc}") from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value.strip().strip('"')
+    return values
+
+
+def preflight_silverblue_host(
+    runner: CommandRunner,
+    config: UpdateConfig,
+    provision_toolbox: ProvisionToolbox,
+    output: Callable[[str], None],
+    *,
+    machine: Callable[[], str] = platform.machine,
+    os_release: Path = Path("/etc/os-release"),
+    ostree_booted: Path = Path("/run/ostree-booted"),
+) -> str:
+    """Prove native Silverblue/OSTree and the persistent Toolbx policy."""
+    architecture = machine().strip().lower()
+    if architecture != "aarch64":
+        raise DownstreamUpdateError(
+            f"downstream update requires native aarch64; found {architecture or 'unknown'}"
+        )
+    values = _os_release_values(os_release)
+    if values.get("ID") != "fedora" or values.get("VARIANT_ID") != "silverblue":
+        raise DownstreamUpdateError("downstream update requires Fedora Silverblue")
+    if not ostree_booted.exists():
+        raise DownstreamUpdateError("downstream update requires an OSTree-booted host")
+    try:
+        release = fedora_release(os_release)
+        container = provision_toolbox(
+            runner=runner,
+            project_root=config.repo.resolve(),
+            host_release=release,
+            toolbox_executable=config.toolbox_executable,
+            output=output,
+        )
+    except Exception as exc:
+        raise DownstreamUpdateError(f"persistent Toolbx preflight failed: {exc}") from exc
+    if container != TOOLBOX_NAME:
+        raise DownstreamUpdateError(
+            f"persistent Toolbx preflight returned {container!r}; expected {TOOLBOX_NAME!r}"
+        )
+    return container
+
+
+@contextmanager
+def _default_transaction_lock(config: UpdateConfig):
+    from hermes_cli.downstream_update_lock import (
+        DownstreamUpdateLockError,
+        UpdaterTransactionLock,
+        transaction_lock_path,
+    )
+
+    try:
+        with UpdaterTransactionLock(path=transaction_lock_path(config.expected_repo)):
+            yield
+    except DownstreamUpdateLockError as exc:
+        raise DownstreamUpdateError(f"updater transaction lock failed: {exc}") from exc
+
+
 def _restore_live_branch(runner: CommandRunner, config: UpdateConfig) -> None:
     if _branch(runner, config.repo) == config.live_branch:
         return
-    _git(
-        runner,
-        config.repo,
-        "checkout",
-        config.live_branch,
-        description=f"restore {config.live_branch}",
-    )
+    try:
+        _git(
+            runner,
+            config.repo,
+            "checkout",
+            config.live_branch,
+            description=f"restore {config.live_branch}",
+        )
+    except BaseException as interrupt:
+        # A one-shot interrupt can land before checkout changes the branch. Make one
+        # finally-safe restoration attempt, then preserve the original interrupt.
+        if isinstance(interrupt, Exception):
+            raise
+        if _branch(runner, config.repo) != config.live_branch:
+            _git(
+                runner,
+                config.repo,
+                "checkout",
+                config.live_branch,
+                description=f"restore {config.live_branch} after interruption",
+            )
+        raise
 
 
 def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
@@ -203,8 +330,9 @@ def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
         repo,
         "fetch",
         config.fork_remote,
+        "+refs/heads/main:refs/remotes/fork/main",
         f"+refs/heads/{branch}:refs/remotes/fork/{branch}",
-        description=f"fetch fork/{branch}",
+        description=f"fetch fork/main and fork/{branch}",
     )
     _git(
         runner,
@@ -214,6 +342,15 @@ def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
         "main",
         "upstream/main",
         description="prove local main can fast-forward to upstream/main",
+    )
+    _git(
+        runner,
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        "fork/main",
+        "upstream/main",
+        description="prove fork main can fast-forward to upstream/main",
     )
     _git(
         runner,
@@ -249,19 +386,32 @@ def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
         )
         if local_main != upstream_main:
             raise DownstreamUpdateError("local main does not exactly match upstream/main")
-        _git(runner, repo, "checkout", branch, description=f"restore {branch}")
         _git(
             runner,
             repo,
-            "merge",
-            "--no-edit",
-            "main",
-            description=f"merge main into {branch}",
+            "push",
+            config.fork_remote,
+            f"{upstream_main}:refs/heads/main",
+            description="publish pristine fork/main",
         )
-    except Exception:
+        fork_main = _remote_branch_sha(runner, config, "main")
+        if fork_main != upstream_main:
+            raise DownstreamUpdateError(
+                f"fork/main {fork_main} does not match upstream/main {upstream_main}"
+            )
+    finally:
+        # BaseException-safe: interrupts after checkout must not strand the live checkout on main.
         _restore_live_branch(runner, config)
-        raise
 
+    _require_branch(runner, repo, branch)
+    _git(
+        runner,
+        repo,
+        "merge",
+        "--no-edit",
+        "main",
+        description=f"merge main into {branch}",
+    )
     _require_branch(runner, repo, branch)
     _require_clean(runner, repo)
 
@@ -278,19 +428,81 @@ def _default_gateway_verifier(_runner: CommandRunner, expected_sha: str) -> None
     verify_gateway_ready(expected_sha)
 
 
-def _verify_onecli(runner: CommandRunner, config: UpdateConfig) -> None:
+def _onecli_local_service_ready(_config: UpdateConfig) -> bool:
+    """Use a real loopback TCP connection; OneCLI exposes no health HTTP route."""
+    try:
+        with socket.create_connection((_ONECLI_HOST, _ONECLI_PORT), timeout=2.0):
+            return True
+    except OSError:
+        return False
+
+
+def _verify_onecli(
+    runner: CommandRunner,
+    config: UpdateConfig,
+    service_ready: OneCLIServiceReady,
+) -> None:
+    if not service_ready(config):
+        raise DownstreamUpdateError("OneCLI local service is not ready")
     status = _run(
         runner,
         [config.onecli_executable, "auth", "status"],
         repo=config.repo,
-        description="OneCLI health check",
+        description="OneCLI authentication check",
     )
     try:
         payload = json.loads(_stdout(status))
     except (TypeError, ValueError) as exc:
-        raise DownstreamUpdateError("OneCLI health check returned invalid JSON") from exc
+        raise DownstreamUpdateError("OneCLI authentication check returned invalid JSON") from exc
     if payload.get("authenticated") is not True:
-        raise DownstreamUpdateError("OneCLI health check is not authenticated")
+        raise DownstreamUpdateError("OneCLI authentication check is not authenticated")
+
+
+def _verify_config(runner: CommandRunner, config: UpdateConfig) -> None:
+    for command, description in (
+        ("migrate", "configuration migration"),
+        ("check", "configuration validation"),
+    ):
+        _run(
+            runner,
+            [config.python_executable, "-m", "hermes_cli.main", "config", command],
+            repo=config.repo,
+            description=description,
+            capture_output=False,
+        )
+
+
+def _verify_runtime_identity(
+    runner: CommandRunner,
+    config: UpdateConfig,
+    expected_sha: str,
+) -> None:
+    result = _run(
+        runner,
+        [
+            config.python_executable,
+            "-m",
+            "hermes_cli.downstream_update",
+            "--runtime-identity-json",
+        ],
+        repo=config.repo,
+        description="runtime revision identity",
+    )
+    try:
+        payload = json.loads(_stdout(result))
+    except (TypeError, ValueError) as exc:
+        raise DownstreamUpdateError("runtime revision identity returned invalid JSON") from exc
+    actual_root = Path(str(payload.get("checkout_root") or "")).resolve()
+    if actual_root != config.expected_repo.resolve():
+        raise DownstreamUpdateError(
+            f"runtime checkout {actual_root} does not match {config.expected_repo.resolve()}"
+        )
+    if payload.get("source") != "git" or payload.get("sha") != expected_sha:
+        raise DownstreamUpdateError(
+            f"runtime revision identity {payload.get('sha')!r} does not match {expected_sha}"
+        )
+    if not isinstance(payload.get("version"), str) or not payload["version"]:
+        raise DownstreamUpdateError("runtime version identity is missing")
 
 
 def _gate(description: str, operation: Callable[[], Any]) -> Any:
@@ -302,8 +514,12 @@ def _gate(description: str, operation: Callable[[], Any]) -> Any:
         raise DownstreamUpdateError(f"{description} failed: {exc}") from exc
 
 
-def _remote_branch_sha(runner: CommandRunner, config: UpdateConfig) -> str:
-    ref = f"refs/heads/{config.live_branch}"
+def _remote_branch_sha(
+    runner: CommandRunner,
+    config: UpdateConfig,
+    branch: str,
+) -> str:
+    ref = f"refs/heads/{branch}"
     result = _git(
         runner,
         config.repo,
@@ -312,26 +528,17 @@ def _remote_branch_sha(runner: CommandRunner, config: UpdateConfig) -> str:
         "--heads",
         config.fork_remote,
         ref,
-        description=f"read fork/{config.live_branch}",
+        description=f"read fork/{branch}",
     )
     for line in _stdout(result).splitlines():
         fields = line.split()
         if len(fields) == 2 and fields[1] == ref:
             return fields[0]
-    raise DownstreamUpdateError(f"fork/{config.live_branch} did not return an exact branch ref")
+    raise DownstreamUpdateError(f"fork/{branch} did not return an exact branch ref")
 
 
-def run_update(
-    config: UpdateConfig,
-    *,
-    runner: CommandRunner | None = None,
-    provision_toolbox: ProvisionToolbox = ensure_desktop_toolbox,
-    verify_artifacts: ArtifactVerifier = _default_artifact_verifier,
-    verify_gateway: GatewayVerifier = _default_gateway_verifier,
-    output: Callable[[str], None] = print,
-) -> str:
-    """Run the complete downstream update, returning the published commit SHA."""
-    command_runner: CommandRunner = runner if runner is not None else SubprocessRunner()
+def _validate_checkout(command_runner: CommandRunner, config: UpdateConfig) -> Path:
+    """Read-only checkout and transport validation performed under the transaction lock."""
     repo = config.repo.resolve()
     expected_repo = config.expected_repo.resolve()
     if repo != expected_repo:
@@ -353,7 +560,6 @@ def run_update(
         raise DownstreamUpdateError(
             f"Git top-level is {actual_root}; expected checkout {expected_repo}"
         )
-
     _require_branch(command_runner, repo, config.live_branch)
     _require_clean(command_runner, repo)
     _require_remote(
@@ -370,6 +576,23 @@ def run_update(
         config.fork_slug,
         push=True,
     )
+    return repo
+
+
+def _run_update_transaction(
+    config: UpdateConfig,
+    *,
+    command_runner: CommandRunner,
+    container: str,
+    verify_artifacts: ArtifactVerifier,
+    verify_gateway: GatewayVerifier,
+    verify_config: ConfigVerifier,
+    verify_runtime_identity: RuntimeIdentityVerifier,
+    onecli_service_ready: OneCLIServiceReady,
+    output: Callable[[str], None],
+) -> str:
+    """Run one validated, locked, and host-preflighted downstream transaction."""
+    repo = config.repo.resolve()
 
     output("→ Synchronizing pristine main and downstream source")
     _sync_source(command_runner, config)
@@ -377,24 +600,15 @@ def run_update(
         _git(command_runner, repo, "rev-parse", "HEAD", description="pin downstream revision")
     )
 
-    output("→ Synchronizing locked Python dependencies")
+    output("→ Synchronizing locked Python dependencies with runtime and dev extras")
     _run(
         command_runner,
-        [config.uv_executable, "sync", "--locked"],
+        [config.uv_executable, "sync", "--locked", "--extra", "all", "--extra", "dev"],
         repo=repo,
         description="locked Python dependency synchronization",
         capture_output=False,
     )
 
-    container = _gate(
-        "Toolbx provisioning",
-        lambda: provision_toolbox(
-            runner=command_runner,
-            project_root=repo,
-            toolbox_executable=config.toolbox_executable,
-            output=output,
-        ),
-    )
     npm = toolbox_npm_command(config.toolbox_executable, container)
 
     output("→ Synchronizing locked Node dependencies in Toolbx")
@@ -414,6 +628,7 @@ def run_update(
             "tests/hermes_cli/test_desktop_toolbox.py",
             "tests/hermes_cli/test_desktop_silverblue_downstream.py",
             "tests/hermes_cli/test_downstream_update.py",
+            "tests/hermes_cli/test_downstream_update_lock.py",
             "tests/hermes_cli/test_downstream_update_verify.py",
         ],
         repo=repo,
@@ -474,13 +689,20 @@ def run_update(
         f"{intended_sha}:refs/heads/{config.live_branch}",
         description=f"push {config.live_branch}",
     )
-    remote_sha = _remote_branch_sha(command_runner, config)
+    remote_sha = _remote_branch_sha(command_runner, config, config.live_branch)
     if remote_sha != intended_sha:
         raise DownstreamUpdateError(
             f"fork/{config.live_branch} {remote_sha} does not match local {intended_sha}"
         )
 
-    _verify_onecli(command_runner, config)
+    output("→ Migrating and validating configuration")
+    _gate("configuration gate", lambda: verify_config(command_runner, config))
+    output("→ Verifying final CLI runtime revision identity")
+    _gate(
+        "runtime-identity gate",
+        lambda: verify_runtime_identity(command_runner, config, intended_sha),
+    )
+    _verify_onecli(command_runner, config, onecli_service_ready)
     output("→ Restarting gateway after all source, test, build, artifact, and push gates")
     _run(
         command_runner,
@@ -500,18 +722,70 @@ def run_update(
     return intended_sha
 
 
+def run_update(
+    config: UpdateConfig,
+    *,
+    runner: CommandRunner | None = None,
+    provision_toolbox: ProvisionToolbox = ensure_desktop_toolbox,
+    verify_artifacts: ArtifactVerifier = _default_artifact_verifier,
+    verify_gateway: GatewayVerifier = _default_gateway_verifier,
+    host_preflight: HostPreflight = preflight_silverblue_host,
+    transaction_lock: TransactionLock = _default_transaction_lock,
+    verify_config: ConfigVerifier = _verify_config,
+    verify_runtime_identity: RuntimeIdentityVerifier = _verify_runtime_identity,
+    onecli_service_ready: OneCLIServiceReady = _onecli_local_service_ready,
+    output: Callable[[str], None] = print,
+) -> str:
+    """Run the complete single-writer downstream update transaction."""
+    command_runner: CommandRunner = runner if runner is not None else SubprocessRunner()
+    with transaction_lock(config):
+        _validate_checkout(command_runner, config)
+        container = _gate(
+            "Silverblue host and persistent Toolbx preflight",
+            lambda: host_preflight(
+                command_runner,
+                config,
+                provision_toolbox,
+                output,
+            ),
+        )
+        return _run_update_transaction(
+            config,
+            command_runner=command_runner,
+            container=container,
+            verify_artifacts=verify_artifacts,
+            verify_gateway=verify_gateway,
+            verify_config=verify_config,
+            verify_runtime_identity=verify_runtime_identity,
+            onecli_service_ready=onecli_service_ready,
+            output=output,
+        )
+
+
+def _runtime_identity_payload() -> dict[str, object]:
+    from hermes_cli.build_info import get_code_identity
+
+    payload: dict[str, object] = dict(get_code_identity(refresh=True))
+    payload["checkout_root"] = str(checkout_root().resolve())
+    return payload
+
+
 def _dry_run_plan() -> tuple[str, ...]:
     return (
-        "validate clean expected ken/downstream checkout and remotes",
-        "fetch upstream/main and fork/ken/downstream",
-        "fast-forward pristine main, restore ken/downstream, merge main",
-        "uv sync --locked",
-        "provision and verify Fedora hermes-arm-build Toolbx",
+        "acquire owner-only single-writer transaction lock",
+        "prove native Fedora Silverblue/OSTree aarch64 and persistent Toolbx readiness",
+        "validate clean expected ken/downstream checkout and canonical GitHub remotes",
+        "fetch upstream/main plus fork/main and fork/ken/downstream",
+        "fast-forward main, prove equality, publish and read back pristine fork/main",
+        "restore ken/downstream in a finally-safe path and merge main",
+        "uv sync --locked --extra all --extra dev",
         "npm ci, focused tests, Web/Desktop typechecks, Web UI build",
         "ARM64 Desktop build through shared Toolbx-aware path",
-        "verify branch, Desktop build stamp, ARM64 app, and ARM64 node-pty",
+        "verify branch, Desktop build stamp, bounded ARM64 ELF app, and node-pty",
         "push fork ken/downstream without force and verify SHA",
-        "OneCLI health check, gateway restart, and platform-ready verification",
+        "migrate/check config and verify final CLI runtime revision identity",
+        "verify OneCLI loopback readiness plus authentication",
+        "gateway restart, then verify live PID/start identity plus platform readiness",
     )
 
 
@@ -523,11 +797,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--repo", type=Path, default=checkout_root())
     parser.add_argument(
+        "--runtime-identity-json",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the transaction plan without reading or changing the checkout",
     )
     args = parser.parse_args(argv)
+    if args.runtime_identity_json:
+        print(json.dumps(_runtime_identity_payload(), sort_keys=True))
+        return 0
     if args.dry_run:
         print("DRY RUN — no commands will execute")
         for number, step in enumerate(_dry_run_plan(), start=1):
