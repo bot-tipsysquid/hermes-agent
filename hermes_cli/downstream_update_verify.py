@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
+import math
 from pathlib import Path
 import struct
 import time
@@ -34,6 +36,22 @@ class ArtifactReceipt:
 
     executable: Path
     node_pty: Path
+
+
+@dataclass(frozen=True)
+class GatewayReceiptIdentity:
+    """Pre-restart receipt fields plus its proven live process incarnation, if any."""
+
+    pid: int | None
+    start_time: object | None
+    updated_at: object | None
+    live_incarnation: tuple[int, object] | None
+
+
+ProcessStartTime = Callable[[int], int | None]
+StartTimesMatch = Callable[[object, object], bool]
+ProcessIdentityMatches = Callable[[dict[str, object], int, Path], bool]
+LiveGatewayPid = Callable[[Path], int | None]
 
 
 def _elf_machine(path: Path) -> int:
@@ -189,28 +207,180 @@ def verify_arm64_update_artifacts(project_root: Path) -> ArtifactReceipt:
     return ArtifactReceipt(executable=executable, node_pty=node_pty)
 
 
-def _platform_ready(value: object, *, pid: object, start_time: object) -> bool:
+def _default_process_start_time(pid: int) -> int | None:
+    from gateway.status import get_process_start_time
+
+    return get_process_start_time(pid)
+
+
+def _default_start_times_match(recorded: object, current: object) -> bool:
+    from gateway.status import start_time_fingerprints_match
+
+    return start_time_fingerprints_match(recorded, current)
+
+
+def _default_process_identity_matches(
+    receipt: dict[str, object], pid: int, profile_home: Path
+) -> bool:
+    from gateway.status import (
+        _record_looks_like_gateway,
+        _record_matches_live_gateway_pid,
+    )
+
+    return _record_looks_like_gateway(receipt) and _record_matches_live_gateway_pid(
+        receipt,
+        pid,
+        expected_home=profile_home,
+    )
+
+
+def _default_live_gateway_pid(profile_home: Path) -> int | None:
+    from gateway.status import live_gateway_pid_for_home
+
+    return live_gateway_pid_for_home(profile_home)
+
+
+def _gateway_state_path(state_path: Path | None) -> Path:
+    if state_path is not None:
+        return state_path
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "gateway_state.json"
+
+
+def _read_gateway_receipt(state_path: Path) -> object | None:
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+
+def capture_gateway_receipt_identity(
+    *,
+    state_path: Path | None = None,
+    process_start_time: ProcessStartTime = _default_process_start_time,
+    start_times_match: StartTimesMatch = _default_start_times_match,
+    process_identity_matches: ProcessIdentityMatches = _default_process_identity_matches,
+    live_gateway_pid: LiveGatewayPid = _default_live_gateway_pid,
+) -> GatewayReceiptIdentity:
+    """Capture the existing receipt and its live gateway incarnation before restart."""
+    path = _gateway_state_path(state_path)
+    payload = _read_gateway_receipt(path)
+    if not isinstance(payload, dict):
+        if path.exists():
+            raise GatewayVerificationError(
+                f"cannot capture pre-restart gateway receipt: {path} is unreadable or malformed"
+            )
+        live_pid = live_gateway_pid(path.parent)
+        if live_pid is None:
+            return GatewayReceiptIdentity(None, None, None, None)
+        live_start = process_start_time(live_pid)
+        if live_start is None:
+            raise GatewayVerificationError(
+                "cannot capture pre-restart gateway process-start fingerprint"
+            )
+        return GatewayReceiptIdentity(None, None, None, (live_pid, live_start))
+
+    receipt = cast(dict[str, object], payload)
+    raw_pid = receipt.get("pid")
+    pid = raw_pid if isinstance(raw_pid, int) and raw_pid > 0 else None
+    recorded_start = receipt.get("start_time")
+    live_incarnation: tuple[int, object] | None = None
+    if pid is not None and recorded_start is not None:
+        live_start = process_start_time(pid)
+        if live_start is not None:
+            try:
+                start_matches = start_times_match(recorded_start, live_start)
+            except (TypeError, ValueError, OverflowError):
+                start_matches = False
+            if start_matches and process_identity_matches(receipt, pid, path.parent):
+                live_incarnation = (pid, live_start)
+
+    return GatewayReceiptIdentity(
+        pid=pid,
+        start_time=recorded_start,
+        updated_at=receipt.get("updated_at"),
+        live_incarnation=live_incarnation,
+    )
+
+
+def _updated_at_epoch(value: object) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        epoch = parsed.timestamp()
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return epoch if math.isfinite(epoch) else None
+
+
+def _platform_ready(
+    value: object,
+    *,
+    pid: int,
+    live_start: object,
+    start_times_match: StartTimesMatch,
+) -> bool:
     if not isinstance(value, dict):
         return False
     platform = cast(dict[str, object], value)
-    return (
+    if (
         str(platform.get("state") or platform.get("status") or "").lower()
-        in _READY_PLATFORM_STATES
-        and platform.get("writer_pid") == pid
-        and platform.get("writer_start_time") == start_time
-    )
+        not in _READY_PLATFORM_STATES
+        or platform.get("writer_pid") != pid
+        or platform.get("writer_start_time") is None
+    ):
+        return False
+    try:
+        return start_times_match(platform["writer_start_time"], live_start)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _same_incarnation(
+    pid: int,
+    live_start: object,
+    pre_restart: GatewayReceiptIdentity,
+    start_times_match: StartTimesMatch,
+) -> bool:
+    if pre_restart.live_incarnation is None:
+        return False
+    pre_pid, pre_start = pre_restart.live_incarnation
+    if pid != pre_pid:
+        return False
+    try:
+        return start_times_match(pre_start, live_start)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _gateway_receipt_error(
     payload: object,
     expected_sha: str,
     *,
-    process_start_time: Callable[[int], int | None],
-    start_times_match: Callable[[object, object], bool],
+    restart_started_at: float,
+    pre_restart: GatewayReceiptIdentity,
+    state_path: Path,
+    process_start_time: ProcessStartTime,
+    start_times_match: StartTimesMatch,
+    process_identity_matches: ProcessIdentityMatches,
 ) -> str | None:
     if not isinstance(payload, dict):
         return "gateway runtime receipt is not an object"
     receipt = cast(dict[str, object], payload)
+    updated_at = receipt.get("updated_at")
+    if updated_at is None or (isinstance(updated_at, str) and not updated_at.strip()):
+        return "gateway runtime receipt updated_at is missing"
+    updated_epoch = _updated_at_epoch(updated_at)
+    if updated_epoch is None:
+        return "gateway runtime receipt updated_at is malformed"
+    if updated_at == pre_restart.updated_at:
+        return "gateway runtime receipt updated_at is unchanged from before restart"
+    if updated_epoch <= restart_started_at:
+        return "gateway runtime receipt updated_at is not newer than the restart attempt"
     if receipt.get("code_sha") != expected_sha:
         return "gateway runtime receipt does not report the expected revision"
     if receipt.get("gateway_state") not in _READY_GATEWAY_STATES:
@@ -227,46 +397,43 @@ def _gateway_receipt_error(
             return "gateway process identity does not match the recorded start time"
     except (TypeError, ValueError, OverflowError):
         return "gateway runtime receipt has a malformed process start time"
+    if not process_identity_matches(receipt, pid, state_path.parent):
+        return "gateway live process does not identify as the Hermes gateway for this profile"
+    if _same_incarnation(pid, live_start, pre_restart, start_times_match):
+        return "gateway restart retained the pre-restart live process incarnation"
     platforms = receipt.get("platforms")
     if not isinstance(platforms, dict) or not any(
-        _platform_ready(value, pid=pid, start_time=recorded_start)
+        _platform_ready(
+            value,
+            pid=pid,
+            live_start=live_start,
+            start_times_match=start_times_match,
+        )
         for value in platforms.values()
     ):
         return "gateway platform-ready writer identity is missing or stale"
     return None
 
 
-def _default_process_start_time(pid: int) -> int | None:
-    from gateway.status import get_process_start_time
-
-    return get_process_start_time(pid)
-
-
-def _default_start_times_match(recorded: object, current: object) -> bool:
-    from gateway.status import start_time_fingerprints_match
-
-    return start_time_fingerprints_match(recorded, current)
-
-
 def verify_gateway_ready(
     expected_sha: str,
     *,
+    restart_started_at: float,
+    pre_restart: GatewayReceiptIdentity,
     state_path: Path | None = None,
     attempts: int = 12,
     interval: float = 5.0,
     sleep: Callable[[float], None] = time.sleep,
-    process_start_time: Callable[[int], int | None] = _default_process_start_time,
-    start_times_match: Callable[[object, object], bool] = _default_start_times_match,
+    process_start_time: ProcessStartTime = _default_process_start_time,
+    start_times_match: StartTimesMatch = _default_start_times_match,
+    process_identity_matches: ProcessIdentityMatches = _default_process_identity_matches,
 ) -> None:
-    """Poll for the intended revision, live process identity, and a ready platform."""
-    if state_path is None:
-        from hermes_constants import get_hermes_home
-
-        state_path = get_hermes_home() / "gateway_state.json"
+    """Poll for a fresh post-attempt receipt, new live gateway, and ready writer."""
+    path = _gateway_state_path(state_path)
     last_error = "gateway runtime receipt is missing"
     for attempt in range(max(1, attempts)):
         try:
-            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             last_error = "gateway runtime receipt is missing"
         except (OSError, json.JSONDecodeError) as exc:
@@ -276,8 +443,12 @@ def verify_gateway_ready(
                 _gateway_receipt_error(
                     payload,
                     expected_sha,
+                    restart_started_at=restart_started_at,
+                    pre_restart=pre_restart,
+                    state_path=path,
                     process_start_time=process_start_time,
                     start_times_match=start_times_match,
+                    process_identity_matches=process_identity_matches,
                 )
                 or ""
             )

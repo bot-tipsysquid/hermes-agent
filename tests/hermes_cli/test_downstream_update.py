@@ -27,6 +27,8 @@ _FORK_URL = "git@github.com:bot-tipsysquid/hermes-agent.git"
 _INITIAL_DOWNSTREAM = "1" * 40
 _UPDATED_DOWNSTREAM = "2" * 40
 _UPSTREAM_SHA = "a" * 40
+_PRE_RESTART_GATEWAY = object()
+_RESTART_THRESHOLD = 1234.5
 
 
 def _result(returncode=0, stdout="", stderr=""):
@@ -95,6 +97,7 @@ class _GitRunner:
             if args == ("rev-parse", "--show-toplevel"):
                 return _result(stdout=f"{self.repo}\n")
             if args == ("branch", "--show-current"):
+                self._interrupt("branch-probe")
                 return _result(stdout=f"{self.branch}\n")
             if args == ("status", "--porcelain", "--untracked-files=all"):
                 return _result(stdout=" M tracked.py\n" if self.dirty else "")
@@ -199,8 +202,15 @@ def _artifact_verifier(runner: _GitRunner, _repo: Path) -> None:
     runner.events.append("artifacts-verified")
 
 
-def _gateway_verifier(runner: _GitRunner, expected_sha: str) -> None:
+def _gateway_verifier(
+    runner: _GitRunner,
+    expected_sha: str,
+    pre_restart: object,
+    restart_started_at: float,
+) -> None:
     assert expected_sha == _UPDATED_DOWNSTREAM
+    assert pre_restart is _PRE_RESTART_GATEWAY
+    assert restart_started_at == _RESTART_THRESHOLD
     runner.events.append("gateway-ready")
 
 
@@ -233,6 +243,14 @@ def _run(runner: _GitRunner, **overrides):
         runner.events.append("onecli-service-ready")
         return True
 
+    def capture_gateway_receipt(_runner):
+        runner.events.append("gateway-receipt-captured")
+        return _PRE_RESTART_GATEWAY
+
+    def restart_clock():
+        runner.events.append("gateway-restart-threshold")
+        return _RESTART_THRESHOLD
+
     kwargs = {
         "runner": runner,
         "provision_toolbox": _provisioner,
@@ -243,6 +261,8 @@ def _run(runner: _GitRunner, **overrides):
         "verify_config": config_verifier,
         "verify_runtime_identity": runtime_identity_verifier,
         "onecli_service_ready": onecli_service_ready,
+        "capture_gateway_receipt": capture_gateway_receipt,
+        "restart_clock": restart_clock,
         "output": lambda _line: None,
     }
     kwargs.update(overrides)
@@ -335,6 +355,12 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
     assert runner.events.index("host-ready") < runner.events.index("toolbox-ready")
     assert runner.events.index("config-ready") < runner.events.index("runtime-identity-ready")
     assert runner.events.index("runtime-identity-ready") < runner.events.index(
+        ("python", "-m", "hermes_cli.main", "gateway", "restart")
+    )
+    assert runner.events.index("gateway-receipt-captured") < runner.events.index(
+        "gateway-restart-threshold"
+    )
+    assert runner.events.index("gateway-restart-threshold") < runner.events.index(
         ("python", "-m", "hermes_cli.main", "gateway", "restart")
     )
 
@@ -617,6 +643,7 @@ class _FatalInterrupt(BaseException):
         ("push-main", KeyboardInterrupt),
         ("readback-main", SystemExit),
         ("checkout-downstream-before", _FatalInterrupt),
+        ("checkout-ken/downstream-after", KeyboardInterrupt),
     ],
 )
 def test_every_main_transition_restores_downstream_on_base_exception(
@@ -630,6 +657,88 @@ def test_every_main_transition_restores_downstream_on_base_exception(
     assert runner.branch == "ken/downstream"
     assert not _ran_uv_sync(runner)
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
+
+
+def test_restore_initial_branch_probe_interruption_restores_then_reraises(tmp_path):
+    runner = _GitRunner(
+        tmp_path,
+        branch="main",
+        interrupt_at="branch-probe",
+        interrupt_type=KeyboardInterrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="branch-probe"):
+        updater._restore_live_branch(runner, _config(tmp_path))
+
+    assert runner.branch == "ken/downstream"
+    assert runner.commands[-1] == ("git", "checkout", "ken/downstream")
+
+
+@pytest.mark.parametrize(
+    "point", ["checkout-downstream-before", "checkout-ken/downstream-after"]
+)
+def test_restore_checkout_interruption_uses_one_unconditional_retry(tmp_path, point):
+    runner = _GitRunner(
+        tmp_path,
+        branch="main",
+        interrupt_at=point,
+        interrupt_type=KeyboardInterrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match=point):
+        updater._restore_live_branch(runner, _config(tmp_path))
+
+    checkouts = [
+        command
+        for command in runner.commands
+        if command == ("git", "checkout", "ken/downstream")
+    ]
+    assert len(checkouts) == 2
+    assert runner.branch == "ken/downstream"
+
+
+class _DoubleFailureRestoreRunner:
+    def __init__(self, repo: Path, initial_location: str, restoration_error: BaseException):
+        self.repo = repo
+        self.initial_location = initial_location
+        self.restoration_error = restoration_error
+        self.commands: list[tuple[str, ...]] = []
+        self.checkout_calls = 0
+
+    def run(self, command, **_kwargs):
+        argv = tuple(str(part) for part in command)
+        self.commands.append(argv)
+        if argv == ("git", "branch", "--show-current"):
+            if self.initial_location == "probe":
+                raise KeyboardInterrupt("initial branch probe interrupted")
+            return _result(stdout="main\n")
+        if argv == ("git", "checkout", "ken/downstream"):
+            self.checkout_calls += 1
+            if self.initial_location == "checkout" and self.checkout_calls == 1:
+                raise KeyboardInterrupt("initial checkout interrupted")
+            raise self.restoration_error
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+@pytest.mark.parametrize(
+    ("initial_location", "restoration_error"),
+    [
+        ("probe", RuntimeError("restoration command failed")),
+        ("checkout", SystemExit("second restoration interrupted")),
+    ],
+)
+def test_restore_double_failure_preserves_original_and_reports_restore_failure(
+    tmp_path, initial_location, restoration_error
+):
+    runner = _DoubleFailureRestoreRunner(tmp_path, initial_location, restoration_error)
+
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        updater._restore_live_branch(runner, _config(tmp_path))
+
+    assert excinfo.value.__cause__ is restoration_error
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any(type(restoration_error).__name__ in note for note in notes)
+    assert runner.checkout_calls <= 2
 
 
 @pytest.mark.parametrize("gate", ["config", "runtime-identity"])
@@ -786,23 +895,32 @@ def test_real_git_conflict_stays_on_downstream_with_recovery_state_visible(tmp_p
     assert "UU shared.txt" in _real_git(checkout, "status", "--porcelain")
 
 
-def test_supported_config_migrate_then_check_command_sequence(tmp_path):
+def test_supported_config_migrate_then_strict_validate_command_sequence(tmp_path):
     runner = _GitRunner(tmp_path)
 
     updater._verify_config(runner, _config(tmp_path))
 
     migrate = ("python", "-m", "hermes_cli.main", "config", "migrate")
-    check = ("python", "-m", "hermes_cli.main", "config", "check")
-    assert runner.commands.index(migrate) < runner.commands.index(check)
+    validate = ("python", "-m", "hermes_cli.main", "config", "validate")
+    assert runner.commands.index(migrate) < runner.commands.index(validate)
 
 
-def test_supported_config_migration_failure_stops_before_check(tmp_path):
+def test_supported_config_migration_failure_stops_before_strict_validation(tmp_path):
     runner = _GitRunner(tmp_path, fail_marker="migrate")
 
     with pytest.raises(DownstreamUpdateError, match="configuration migration"):
         updater._verify_config(runner, _config(tmp_path))
 
-    assert ("python", "-m", "hermes_cli.main", "config", "check") not in runner.commands
+    assert ("python", "-m", "hermes_cli.main", "config", "validate") not in runner.commands
+
+
+def test_strict_config_validation_failure_stops_before_gateway_restart(tmp_path):
+    runner = _GitRunner(tmp_path, fail_marker="validate")
+
+    with pytest.raises(DownstreamUpdateError, match="strict configuration validation"):
+        _run(runner, verify_config=updater._verify_config)
+
+    assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
 
 def test_runtime_identity_gate_rejects_other_revision(tmp_path):
@@ -837,3 +955,14 @@ def test_dry_run_prints_plan_without_touching_checkout(capsys):
     assert "DRY RUN" in output
     assert "ken/downstream" in output
     assert "gateway restart" in output
+    numbered_steps = [line for line in output.splitlines() if line[:2].strip().isdigit()]
+    assert len(numbered_steps) == 14
+    checkout_validation = next(
+        index for index, line in enumerate(numbered_steps) if "validate clean expected" in line
+    )
+    host_preflight = next(
+        index for index, line in enumerate(numbered_steps) if "native Fedora Silverblue" in line
+    )
+    assert checkout_validation < host_preflight
+    assert "strictly validate config" in numbered_steps[11]
+    assert "capture pre-restart" in numbered_steps[13]

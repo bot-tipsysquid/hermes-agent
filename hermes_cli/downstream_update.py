@@ -16,6 +16,7 @@ import platform
 import socket
 import subprocess
 import sys
+import time
 from typing import Any, Callable, ContextManager, Sequence
 from urllib.parse import urlsplit
 
@@ -59,7 +60,9 @@ class UpdateConfig:
 
 ProvisionToolbox = Callable[..., str]
 ArtifactVerifier = Callable[[CommandRunner, Path], None]
-GatewayVerifier = Callable[[CommandRunner, str], None]
+GatewayVerifier = Callable[[CommandRunner, str, object, float], None]
+GatewayReceiptCapturer = Callable[[CommandRunner], object]
+RestartClock = Callable[[], float]
 HostPreflight = Callable[
     [CommandRunner, UpdateConfig, ProvisionToolbox, Callable[[str], None]], str
 ]
@@ -288,29 +291,51 @@ def _default_transaction_lock(config: UpdateConfig):
 
 
 def _restore_live_branch(runner: CommandRunner, config: UpdateConfig) -> None:
-    if _branch(runner, config.repo) == config.live_branch:
-        return
-    try:
+    """Restore the live branch with one bounded retry while preserving interruptions."""
+
+    def checkout_live(description: str) -> None:
         _git(
             runner,
             config.repo,
             "checkout",
             config.live_branch,
-            description=f"restore {config.live_branch}",
+            description=description,
         )
-    except BaseException as interrupt:
-        # A one-shot interrupt can land before checkout changes the branch. Make one
-        # finally-safe restoration attempt, then preserve the original interrupt.
-        if isinstance(interrupt, Exception):
-            raise
-        if _branch(runner, config.repo) != config.live_branch:
-            _git(
-                runner,
-                config.repo,
-                "checkout",
-                config.live_branch,
-                description=f"restore {config.live_branch} after interruption",
-            )
+
+    def reraise_with_restore_failure(
+        original: BaseException, restoration: BaseException
+    ) -> None:
+        original.add_note(
+            "live-branch restoration also failed: "
+            f"{type(restoration).__name__}: {restoration}"
+        )
+        raise original from restoration
+
+    try:
+        current_branch = _branch(runner, config.repo)
+    except BaseException as original:
+        # The failed probe cannot prove whether checkout-main already took effect.
+        # Make exactly one unconditional restoration attempt before preserving it.
+        try:
+            checkout_live(f"restore {config.live_branch} after branch-probe failure")
+        except BaseException as restoration:
+            reraise_with_restore_failure(original, restoration)
+        raise
+
+    # A downstream merge conflict is explicit recovery state. Avoid even a
+    # same-branch checkout so Git's merge state remains untouched.
+    if current_branch == config.live_branch:
+        return
+
+    try:
+        checkout_live(f"restore {config.live_branch}")
+    except BaseException as original:
+        # An interrupt can land before or after Git switches branches. Retrying
+        # checkout unconditionally is bounded and safe in both cases.
+        try:
+            checkout_live(f"restore {config.live_branch} after interruption")
+        except BaseException as restoration:
+            reraise_with_restore_failure(original, restoration)
         raise
 
 
@@ -422,10 +447,28 @@ def _default_artifact_verifier(_runner: CommandRunner, repo: Path) -> None:
     verify_arm64_update_artifacts(repo)
 
 
-def _default_gateway_verifier(_runner: CommandRunner, expected_sha: str) -> None:
+def _default_gateway_receipt_capturer(_runner: CommandRunner) -> object:
+    from hermes_cli.downstream_update_verify import capture_gateway_receipt_identity
+
+    return capture_gateway_receipt_identity()
+
+
+def _default_gateway_verifier(
+    _runner: CommandRunner,
+    expected_sha: str,
+    pre_restart: object,
+    restart_started_at: float,
+) -> None:
+    from hermes_cli.downstream_update_verify import GatewayReceiptIdentity
     from hermes_cli.downstream_update_verify import verify_gateway_ready
 
-    verify_gateway_ready(expected_sha)
+    if not isinstance(pre_restart, GatewayReceiptIdentity):
+        raise DownstreamUpdateError("pre-restart gateway receipt identity is invalid")
+    verify_gateway_ready(
+        expected_sha,
+        pre_restart=pre_restart,
+        restart_started_at=restart_started_at,
+    )
 
 
 def _onecli_local_service_ready(_config: UpdateConfig) -> bool:
@@ -461,7 +504,7 @@ def _verify_onecli(
 def _verify_config(runner: CommandRunner, config: UpdateConfig) -> None:
     for command, description in (
         ("migrate", "configuration migration"),
-        ("check", "configuration validation"),
+        ("validate", "strict configuration validation"),
     ):
         _run(
             runner,
@@ -586,6 +629,8 @@ def _run_update_transaction(
     container: str,
     verify_artifacts: ArtifactVerifier,
     verify_gateway: GatewayVerifier,
+    capture_gateway_receipt: GatewayReceiptCapturer,
+    restart_clock: RestartClock,
     verify_config: ConfigVerifier,
     verify_runtime_identity: RuntimeIdentityVerifier,
     onecli_service_ready: OneCLIServiceReady,
@@ -703,6 +748,11 @@ def _run_update_transaction(
         lambda: verify_runtime_identity(command_runner, config, intended_sha),
     )
     _verify_onecli(command_runner, config, onecli_service_ready)
+    pre_restart = _gate(
+        "pre-restart gateway receipt capture",
+        lambda: capture_gateway_receipt(command_runner),
+    )
+    restart_started_at = restart_clock()
     output("→ Restarting gateway after all source, test, build, artifact, and push gates")
     _run(
         command_runner,
@@ -717,7 +767,15 @@ def _run_update_transaction(
         description="gateway restart",
         capture_output=False,
     )
-    _gate("gateway readiness verification", lambda: verify_gateway(command_runner, intended_sha))
+    _gate(
+        "gateway readiness verification",
+        lambda: verify_gateway(
+            command_runner,
+            intended_sha,
+            pre_restart,
+            restart_started_at,
+        ),
+    )
     output(f"✓ Downstream update complete at {intended_sha}")
     return intended_sha
 
@@ -729,6 +787,8 @@ def run_update(
     provision_toolbox: ProvisionToolbox = ensure_desktop_toolbox,
     verify_artifacts: ArtifactVerifier = _default_artifact_verifier,
     verify_gateway: GatewayVerifier = _default_gateway_verifier,
+    capture_gateway_receipt: GatewayReceiptCapturer = _default_gateway_receipt_capturer,
+    restart_clock: RestartClock = time.time,
     host_preflight: HostPreflight = preflight_silverblue_host,
     transaction_lock: TransactionLock = _default_transaction_lock,
     verify_config: ConfigVerifier = _verify_config,
@@ -755,6 +815,8 @@ def run_update(
             container=container,
             verify_artifacts=verify_artifacts,
             verify_gateway=verify_gateway,
+            capture_gateway_receipt=capture_gateway_receipt,
+            restart_clock=restart_clock,
             verify_config=verify_config,
             verify_runtime_identity=verify_runtime_identity,
             onecli_service_ready=onecli_service_ready,
@@ -773,8 +835,8 @@ def _runtime_identity_payload() -> dict[str, object]:
 def _dry_run_plan() -> tuple[str, ...]:
     return (
         "acquire owner-only single-writer transaction lock",
-        "prove native Fedora Silverblue/OSTree aarch64 and persistent Toolbx readiness",
         "validate clean expected ken/downstream checkout and canonical GitHub remotes",
+        "prove native Fedora Silverblue/OSTree aarch64 and persistent Toolbx readiness",
         "fetch upstream/main plus fork/main and fork/ken/downstream",
         "fast-forward main, prove equality, publish and read back pristine fork/main",
         "restore ken/downstream in a finally-safe path and merge main",
@@ -783,9 +845,9 @@ def _dry_run_plan() -> tuple[str, ...]:
         "ARM64 Desktop build through shared Toolbx-aware path",
         "verify branch, Desktop build stamp, bounded ARM64 ELF app, and node-pty",
         "push fork ken/downstream without force and verify SHA",
-        "migrate/check config and verify final CLI runtime revision identity",
+        "migrate then strictly validate config and verify final CLI runtime revision identity",
         "verify OneCLI loopback readiness plus authentication",
-        "gateway restart, then verify live PID/start identity plus platform readiness",
+        "capture pre-restart gateway identity, record restart threshold, gateway restart, then verify a fresh new live gateway incarnation and matching platform writer",
     )
 
 

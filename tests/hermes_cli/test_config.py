@@ -845,6 +845,115 @@ class TestConfigVersionDetection:
         assert env_path.read_bytes() == env_bytes
 
 
+class TestStrictConfigValidation:
+    def _write(self, tmp_path, content):
+        (tmp_path / "config.yaml").write_text(content, encoding="utf-8")
+
+    def _validate(self, tmp_path):
+        from hermes_cli.config import validate_config_strict
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            validate_config_strict()
+
+    def test_accepts_current_structurally_valid_config(self, tmp_path):
+        self._write(tmp_path, f"_config_version: {DEFAULT_CONFIG['_config_version']}\n")
+
+        self._validate(tmp_path)
+
+    def test_rejects_config_below_supported_migration_floor(self, tmp_path):
+        self._write(tmp_path, "_config_version: 11\n")
+
+        with pytest.raises(InvalidUserConfigError, match="predates version 12"):
+            self._validate(tmp_path)
+
+    def test_rejects_stale_post_migration_config_version(self, tmp_path):
+        from hermes_cli.config_migrations import SUPPORT_FLOOR_VERSION
+
+        self._write(tmp_path, f"_config_version: {SUPPORT_FLOOR_VERSION}\n")
+
+        with pytest.raises(InvalidUserConfigError, match="version.*current.*required"):
+            self._validate(tmp_path)
+
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            ("model: [unterminated\n", "not valid YAML"),
+            ("- not-a-mapping\n", "must be a mapping"),
+            (
+                f"_config_version: {DEFAULT_CONFIG['_config_version']}\n"
+                "voice:\n  submit_mode: later\n",
+                "voice.submit_mode",
+            ),
+        ],
+    )
+    def test_rejects_parse_and_schema_failures(self, tmp_path, content, message):
+        self._write(tmp_path, content)
+
+        with pytest.raises(InvalidUserConfigError, match=message):
+            self._validate(tmp_path)
+
+    def test_rejects_missing_required_nested_setting(self, tmp_path):
+        self._write(
+            tmp_path,
+            f"_config_version: {DEFAULT_CONFIG['_config_version']}\n"
+            "custom_providers:\n  - name: local\n",
+        )
+
+        with pytest.raises(InvalidUserConfigError, match="missing 'base_url'"):
+            self._validate(tmp_path)
+
+    def test_rejects_missing_required_environment_variable(self, tmp_path):
+        from hermes_cli import config as config_module
+
+        self._write(tmp_path, f"_config_version: {DEFAULT_CONFIG['_config_version']}\n")
+        required = {
+            "TMM419_REQUIRED": {
+                "description": "TMM-419 required setting",
+                "prompt": "Required",
+            }
+        }
+        with patch.object(config_module, "REQUIRED_ENV_VARS", required):
+            with pytest.raises(InvalidUserConfigError, match="TMM419_REQUIRED"):
+                self._validate(tmp_path)
+
+    def test_uses_one_raw_snapshot_for_version_and_structure(self, tmp_path):
+        from hermes_cli import config as config_module
+
+        self._write(tmp_path, "_config_version: 12\n")
+        with patch.object(
+            config_module,
+            "check_config_version",
+            return_value=(DEFAULT_CONFIG["_config_version"], DEFAULT_CONFIG["_config_version"]),
+        ):
+            with pytest.raises(InvalidUserConfigError, match="version 12 is not current"):
+                self._validate(tmp_path)
+
+    def test_does_not_echo_invalid_container_values(self, tmp_path):
+        marker = "do-not-print-this-api-key"
+        self._write(
+            tmp_path,
+            f'_config_version: {DEFAULT_CONFIG["_config_version"]}\n'
+            f'providers: \'{{"api_key": "{marker}"}}\'\n',
+        )
+
+        with pytest.raises(InvalidUserConfigError) as exc_info:
+            self._validate(tmp_path)
+        assert marker not in str(exc_info.value)
+
+    def test_validate_command_exits_nonzero_on_strict_failure(self, tmp_path, capsys):
+        from argparse import Namespace
+
+        from hermes_cli.config import config_command
+
+        self._write(tmp_path, "_config_version: 11\n")
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(SystemExit) as excinfo:
+                config_command(Namespace(config_command="validate"))
+
+        assert excinfo.value.code == 1
+        assert "predates version 12" in capsys.readouterr().err
+
+
 class TestConfigSupportFloor:
     """Auto-migration support floor (v12).
 

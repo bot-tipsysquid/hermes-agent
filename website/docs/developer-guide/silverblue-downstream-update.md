@@ -30,43 +30,50 @@ paths fail before fetch.
 
 ## Transaction
 
-The updater performs these gates in order:
+The updater performs these 14 gates in this exact order:
 
 1. Acquire a deterministic owner-only, per-checkout transaction lock. A live
    concurrent invocation fails before checkout validation or mutation; an
    unlocked stale metadata file is safely reused.
-2. Before Git mutation, require native `aarch64`, Fedora Silverblue metadata,
+2. Validate the exact checkout, `ken/downstream` branch, cleanliness, and
+   canonical fetch and push remote transports. These read-only Git checks run
+   under the lock before any host or Toolbx preflight.
+3. Require native `aarch64`, Fedora Silverblue metadata,
    `/run/ostree-booted`, and a release-matched persistent
    `hermes-arm-build` Toolbx. Compiler and Node build packages are installed
    inside Toolbx, never layered onto the immutable host.
-3. Validate the exact checkout, branch, cleanliness, and canonical fetch/push
-   remote transports, then fetch `upstream/main`, `fork/main`, and
-   `fork/ken/downstream`.
-4. Reject local or fork `main` when it is ahead/diverged, fast-forward local
+4. Fetch `upstream/main`, `fork/main`, and `fork/ken/downstream`.
+5. Reject local or fork `main` when it is ahead or diverged, fast-forward local
    `main`, prove exact equality with `upstream/main`, push it to `fork/main`
    without force, and read back the exact SHA.
-5. Restore `ken/downstream` in a `BaseException`-safe path and merge `main`
+6. Restore `ken/downstream` in a `BaseException`-safe path and merge `main`
    without rebasing, force-pushing, aborting, or automatically resolving
    downstream conflicts.
-6. Run `uv sync --locked --extra all --extra dev` from `ken/downstream`, so
+7. Run `uv sync --locked --extra all --extra dev` from `ken/downstream`, so
    runtime and test extras are retained before the focused suite.
-7. Run locked Node installation, focused updater tests, Web/Desktop typechecks,
-   the Web UI build, and the shared Toolbx-aware Desktop package path.
-8. Require a current Desktop content stamp plus bounded, structurally plausible
-   ARM64 ELF64 binaries for both the packaged application and packaged
-   `node-pty`.
-9. Push `ken/downstream` to `fork/ken/downstream` without force and read back the
-   exact remote SHA.
-10. Run the supported `hermes config migrate` and `hermes config check` paths,
-    then require a fresh CLI runtime identity report whose checkout and revision
-    exactly match the accepted downstream commit.
-11. Prove the OneCLI loopback service accepts a TCP connection and
+8. Run locked Node installation, focused updater tests, Web and Desktop
+   typechecks, and the Web UI build.
+9. Run the shared Toolbx-aware ARM64 Desktop package path.
+10. Recheck the branch and require a current Desktop content stamp plus bounded,
+    structurally plausible ARM64 ELF64 binaries for both the packaged
+    application and packaged `node-pty`.
+11. Push `ken/downstream` to `fork/ken/downstream` without force and read back
+    the exact remote SHA.
+12. Run `hermes config migrate`, then the non-interactive strict
+    `hermes config validate` gate. Validation fails nonzero for an unsupported
+    migration floor, a post-migration schema-version mismatch, parse or schema
+    failures, missing required config settings, or missing required environment
+    variables. Then require a fresh CLI runtime identity report whose checkout
+    and revision exactly match the accepted downstream commit.
+13. Prove the OneCLI loopback service accepts a TCP connection and
     `onecli auth status` reports authenticated. No `/health` or `/healthz` route
     is assumed.
-12. Restart the gateway, then require the runtime receipt to report the pushed
-    SHA, a live PID whose process-start fingerprint matches the receipt, and at
-    least one connected platform whose writer PID/start identity is that same
-    gateway incarnation.
+14. Capture the pre-restart gateway receipt identity, including its PID/start
+    fingerprint and `updated_at` when present, then record the restart threshold
+    and restart the gateway. Require a newer parseable receipt created after
+    that threshold, a different live Hermes gateway PID/start incarnation when
+    one existed before restart, and a connected platform writer whose PID/start
+    identity matches that new gateway incarnation.
 
 Any failed gate stops the sequence. Publishing pristine `fork/main` necessarily
 precedes the downstream merge and build gates, but `fork/ken/downstream` is not
@@ -94,16 +101,21 @@ silently recreated; inspect and replace it manually before retrying.
 - Merge conflicts are intentionally left in place on `ken/downstream`; resolve
   or abort them manually after inspecting the conflict.
 - `KeyboardInterrupt`, `SystemExit`, and other `BaseException` failures while
-  `main` is checked out restore `ken/downstream` whenever checkout restoration
-  is safe. Builds and restarts never run from `main`.
+  `main` may be checked out trigger one bounded, unconditional restoration to
+  `ken/downstream`, including failure of the initial branch probe. The original
+  interruption is re-raised; if restoration also fails, that second failure is
+  attached rather than hidden. An already-active downstream merge is left
+  untouched. Builds and restarts never run from `main`.
 - Pristine `fork/main` is an explicit transaction output. Local-ahead/diverged
   `main`, fork-ahead/diverged `main`, and post-push readback mismatches stop the
   update.
-- Gateway readiness requires a current `gateway_state.json` receipt with at
-  least one platform in `connected`, `running`, or `ok` state and a matching
-  live process identity. Installations intentionally configured with no
-  platforms need a separately reviewed readiness policy before using the real
-  command.
+- Gateway readiness requires a `gateway_state.json` receipt with a parseable
+  `updated_at` newer than the recorded restart threshold, canonical Hermes
+  gateway kind/argv/home ownership, a matching live PID/start fingerprint, and
+  at least one platform in `connected`, `running`, or `ok` state whose writer
+  PID/start identity matches that new gateway incarnation. Installations
+  intentionally configured with no platforms need a separately reviewed
+  readiness policy before using the real command.
 - The command is for Fedora Silverblue source installations on native ARM64. It
   is not a general cross-platform updater or a Flatpak/prebuilt distribution
   path.

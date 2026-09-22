@@ -94,6 +94,10 @@ def test_config_get_unset_subcommands_parse():
     assert ns.config_command == "unset"
     assert ns.key == "terminal.backend"
 
+    ns = parser.parse_args(["config", "validate"])
+    assert ns.func is handler
+    assert ns.config_command == "validate"
+
 
 
 

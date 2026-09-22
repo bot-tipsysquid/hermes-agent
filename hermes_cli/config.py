@@ -1254,7 +1254,7 @@ def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue
             continue
         if isinstance(parsed, (list, dict)):
             _issue(issues, "warning",
-                   f"{key} is the quoted string {value!r} — Hermes expects a YAML {kind} here "
+                   f"{key} is a quoted string — Hermes expects a YAML {kind} here "
                    "and every reader ignores the string",
                    f"Run: hermes config set {key} {shlex.quote(value)}  (stores a real {kind}), "
                    "or remove the quotes in config.yaml")
@@ -1301,6 +1301,63 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
+
+
+def validate_config_strict() -> None:
+    """Fail unless the persisted config is current and operationally complete.
+
+    Unlike ``config check``, this non-interactive gate treats every detected
+    structural issue, missing required value, and schema-version mismatch as an
+    error. It deliberately reads the raw user file after strict parsing so
+    merged defaults cannot hide a stale or malformed persisted configuration.
+    """
+    latest_version = _coerce_config_version(DEFAULT_CONFIG.get("_config_version", 1)) or 1
+    config_path = get_config_path()
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            loaded = fast_safe_load(config_file)
+    except FileNotFoundError:
+        raw_config: Dict[str, Any] = {}
+        current_version = latest_version
+    except Exception as exc:
+        raise InvalidUserConfigError(
+            f"Cannot inspect {config_path}: config.yaml is not valid YAML ({exc})"
+        ) from exc
+    else:
+        if loaded is None:
+            raw_config = {}
+        elif not isinstance(loaded, dict):
+            raise InvalidUserConfigError(
+                f"Cannot inspect {config_path}: config.yaml top-level value must be a mapping, "
+                f"got {type(loaded).__name__}"
+            )
+        else:
+            raw_config = loaded
+        current_version = _coerce_config_version(raw_config.get("_config_version"))
+
+    from hermes_cli.config_migrations import SUPPORT_FLOOR_VERSION, support_floor_message
+
+    if (
+        "_config_version" in raw_config
+        and current_version < SUPPORT_FLOOR_VERSION
+        and current_version < latest_version
+    ):
+        raise InvalidUserConfigError(support_floor_message())
+
+    failures: List[str] = []
+    if current_version != latest_version:
+        failures.append(
+            f"config version {current_version} is not current; version {latest_version} is required"
+        )
+
+    failures.extend(issue.message for issue in validate_config_structure(raw_config))
+    failures.extend(
+        f"required environment variable {entry['name']} is missing"
+        for entry in get_missing_env_vars(required_only=True)
+    )
+    if failures:
+        details = "\n".join(f"- {failure}" for failure in failures)
+        raise InvalidUserConfigError(f"Strict configuration validation failed:\n{details}")
 
 
 def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
@@ -3906,6 +3963,15 @@ def _cmd_config_check(args):
     print()
 
 
+def _cmd_config_validate(args):
+    """Strict, non-interactive validation for automation gates."""
+    try:
+        validate_config_strict()
+    except InvalidUserConfigError as exc:
+        _exit_invalid(f"✗ {exc}")
+    print(color("✓ Configuration passed strict validation", Colors.GREEN))
+
+
 _CONFIG_SUBCOMMANDS = {
     None: lambda args: show_config(),
     "show": lambda args: show_config(),
@@ -3916,7 +3982,8 @@ _CONFIG_SUBCOMMANDS = {
     "path": lambda args: print(get_config_path()),
     "env-path": lambda args: print(get_env_path()),
     "migrate": _cmd_config_migrate,
-    "check": _cmd_config_check}
+    "check": _cmd_config_check,
+    "validate": _cmd_config_validate}
 
 _CONFIG_USAGE = """Available commands:
   hermes config           Show current configuration
@@ -3925,6 +3992,7 @@ _CONFIG_USAGE = """Available commands:
   hermes config set <key> <value>   Set a config value
   hermes config unset <key>        Remove a config value
   hermes config check     Check for missing/outdated config
+  hermes config validate  Strict non-interactive config validation
   hermes config migrate   Update config with new options
   hermes config path      Show config file path
   hermes config env-path  Show .env file path"""
