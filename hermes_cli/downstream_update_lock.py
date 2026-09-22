@@ -46,9 +46,8 @@ def transaction_lock_path(repo: Path, *, runtime_dir: Path | None = None) -> Pat
 class UpdaterTransactionLock:
     """Advisory owner-only lock held from updater entry through readiness verification."""
 
-    def __init__(self, *, path: Path, repair_permissions: bool = True) -> None:
+    def __init__(self, *, path: Path) -> None:
         self.path = path
-        self.repair_permissions = repair_permissions
         self._fd: int | None = None
 
     def _runtime_root(self) -> Path:
@@ -140,16 +139,9 @@ class UpdaterTransactionLock:
             self._require_owner(metadata, "updater lock directory")
             mode = stat.S_IMODE(metadata.st_mode)
             if mode != _OWNER_ONLY_DIRECTORY_MODE:
-                if not self.repair_permissions:
-                    raise DownstreamUpdateLockError(
-                        f"updater lock directory permissions are not owner-only: {mode:o}"
-                    )
-                try:
-                    os.fchmod(directory_fd, _OWNER_ONLY_DIRECTORY_MODE)
-                except OSError as exc:
-                    raise DownstreamUpdateLockError(
-                        "cannot enforce owner-only updater lock directory permissions"
-                    ) from exc
+                raise DownstreamUpdateLockError(
+                    f"updater lock directory permissions are not owner-only: {mode:o}"
+                )
             prepared_fd, directory_fd = directory_fd, None
             return prepared_fd
         except BaseException:
@@ -189,11 +181,9 @@ class UpdaterTransactionLock:
                 raise DownstreamUpdateLockError("updater transaction lock is not a regular file")
             self._require_owner(metadata, "updater transaction lock")
             if stat.S_IMODE(metadata.st_mode) != _OWNER_ONLY_FILE_MODE:
-                if not self.repair_permissions:
-                    raise DownstreamUpdateLockError(
-                        "updater transaction lock permissions are not owner-only"
-                    )
-                os.fchmod(fd, _OWNER_ONLY_FILE_MODE)
+                raise DownstreamUpdateLockError(
+                    "updater transaction lock permissions are not owner-only"
+                )
 
             try:
                 import fcntl

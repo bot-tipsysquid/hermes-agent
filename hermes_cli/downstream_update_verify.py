@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
+import stat
 import struct
 import time
 from typing import Callable, cast
@@ -52,13 +54,76 @@ ProcessStartTime = Callable[[int], int | None]
 StartTimesMatch = Callable[[object, object], bool]
 ProcessIdentityMatches = Callable[[dict[str, object], int, Path], bool]
 LiveGatewayPid = Callable[[Path], int | None]
+OpenFile = Callable[..., int]
 
 
-def _elf_machine(path: Path) -> int:
-    """Validate a bounded, structurally plausible ELF64 image and return e_machine."""
+def _open_contained_artifact(
+    path: Path,
+    *,
+    traversal_root: Path,
+    containment_root: Path,
+    open_file: OpenFile,
+) -> int:
+    artifact = Path(os.path.abspath(path))
+    traversal = Path(os.path.abspath(traversal_root))
+    containment = Path(os.path.abspath(containment_root))
     try:
-        file_size = path.stat().st_size
-        with path.open("rb") as stream:
+        artifact.relative_to(containment)
+        relative = artifact.relative_to(traversal)
+    except ValueError as exc:
+        raise ArtifactVerificationError(
+            f"packaged artifact is outside the expected release root: {path}"
+        ) from exc
+    if not relative.parts:
+        raise ArtifactVerificationError(f"packaged artifact path is invalid: {path}")
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | getattr(os, "O_DIRECTORY", 0)
+    artifact_flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | getattr(os, "O_NONBLOCK", 0)
+    directory_fd: int | None = None
+    try:
+        directory_fd = open_file(traversal, directory_flags)
+        for component in relative.parts[:-1]:
+            next_fd = open_file(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return open_file(relative.parts[-1], artifact_flags, dir_fd=directory_fd)
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _elf_machine(
+    path: Path,
+    *,
+    traversal_root: Path | None = None,
+    containment_root: Path | None = None,
+    require_executable: bool = False,
+    open_file: OpenFile = os.open,
+) -> int:
+    """Validate a bounded, structurally plausible ELF64 image and return e_machine."""
+    root = traversal_root or path.parent
+    allowed = containment_root or path.parent
+    descriptor: int | None = None
+    try:
+        descriptor = _open_contained_artifact(
+            path,
+            traversal_root=root,
+            containment_root=allowed,
+            open_file=open_file,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ArtifactVerificationError(
+                f"packaged artifact is not a regular file: {path}"
+            )
+        if require_executable and not stat.S_IMODE(metadata.st_mode) & 0o111:
+            raise ArtifactVerificationError(
+                f"packaged application has no executable mode: {path}"
+            )
+        file_size = metadata.st_size
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = None
             header = stream.read(64)
             if len(header) != 64:
                 raise ArtifactVerificationError(
@@ -167,10 +232,30 @@ def _elf_machine(path: Path) -> int:
         raise
     except (OSError, struct.error) as exc:
         raise ArtifactVerificationError(f"cannot validate packaged ELF {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _require_aarch64(path: Path, label: str) -> None:
-    if _elf_machine(path) != _EM_AARCH64:
+def _require_aarch64(
+    path: Path,
+    label: str,
+    *,
+    traversal_root: Path,
+    containment_root: Path,
+    require_executable: bool = False,
+    open_file: OpenFile = os.open,
+) -> None:
+    if (
+        _elf_machine(
+            path,
+            traversal_root=traversal_root,
+            containment_root=containment_root,
+            require_executable=require_executable,
+            open_file=open_file,
+        )
+        != _EM_AARCH64
+    ):
         raise ArtifactVerificationError(f"packaged {label} is not ARM64 aarch64 ELF: {path}")
 
 
@@ -189,21 +274,50 @@ def _node_pty_candidates(executable: Path) -> tuple[Path, ...]:
     )
 
 
-def verify_arm64_update_artifacts(project_root: Path) -> ArtifactReceipt:
+def verify_arm64_update_artifacts(
+    project_root: Path,
+    *,
+    open_file: OpenFile = os.open,
+) -> ArtifactReceipt:
     """Require a current Desktop stamp plus ARM64 app and packaged node-pty."""
     root = project_root.resolve()
     desktop = root / "apps" / "desktop"
+    release_root = desktop / "release"
     executable = _desktop_packaged_executable(desktop)
-    if executable is None or not executable.is_file():
+    if executable is None:
         raise ArtifactVerificationError("packaged ARM64 Desktop application is missing")
     if _desktop_build_needed(desktop, root, source_mode=False):
         raise ArtifactVerificationError("Desktop build stamp is stale, missing, or incomplete")
-    _require_aarch64(executable, "application")
+    _require_aarch64(
+        executable,
+        "application",
+        traversal_root=root,
+        containment_root=release_root,
+        require_executable=True,
+        open_file=open_file,
+    )
 
-    node_pty = next((candidate for candidate in _node_pty_candidates(executable) if candidate.is_file()), None)
+    node_pty = None
+    for candidate in _node_pty_candidates(executable):
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ArtifactVerificationError(
+                f"cannot inspect packaged node-pty native module: {exc}"
+            ) from exc
+        node_pty = candidate
+        break
     if node_pty is None:
         raise ArtifactVerificationError("packaged node-pty native module is missing")
-    _require_aarch64(node_pty, "node-pty")
+    _require_aarch64(
+        node_pty,
+        "node-pty",
+        traversal_root=root,
+        containment_root=executable.parent,
+        open_file=open_file,
+    )
     return ArtifactReceipt(executable=executable, node_pty=node_pty)
 
 

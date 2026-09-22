@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 import platform
+import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -58,6 +61,15 @@ class UpdateConfig:
     onecli_executable: str = "onecli"
 
 
+@dataclass(frozen=True)
+class CheckoutIdentity:
+    """Canonical path and stable filesystem identity for the validated checkout."""
+
+    path: Path
+    device: int
+    inode: int
+
+
 ProvisionToolbox = Callable[..., str]
 ArtifactVerifier = Callable[[CommandRunner, Path], None]
 GatewayVerifier = Callable[[CommandRunner, str, object, float], None]
@@ -70,6 +82,70 @@ TransactionLock = Callable[[UpdateConfig], ContextManager[object]]
 ConfigVerifier = Callable[[CommandRunner, UpdateConfig], None]
 RuntimeIdentityVerifier = Callable[[CommandRunner, UpdateConfig, str], None]
 OneCLIServiceReady = Callable[[UpdateConfig], bool]
+ExecutableResolver = Callable[[str], str | None]
+
+
+_GIT_REDIRECT_ENVIRONMENT = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_EXEC_PATH",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PROXY_COMMAND",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_WORK_TREE",
+}
+
+
+class SafeGitRunner:
+    """Pin Git and make updater-owned invocations ignore mutable hooks/redirects."""
+
+    def __init__(self, delegate: CommandRunner, git_executable: Path) -> None:
+        self._delegate = delegate
+        self._git_executable = git_executable
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def run(self, command: Sequence[str], **kwargs: Any) -> Any:
+        argv = [str(part) for part in command]
+        if not argv or argv[0] != "git":
+            return self._delegate.run(argv, **kwargs)
+
+        source_environment = kwargs.get("env")
+        environment = dict(os.environ if source_environment is None else source_environment)
+        for name in tuple(environment):
+            if (
+                name in _GIT_REDIRECT_ENVIRONMENT
+                or name == "GIT_CONFIG_COUNT"
+                or name.startswith("GIT_CONFIG_KEY_")
+                or name.startswith("GIT_CONFIG_VALUE_")
+            ):
+                environment.pop(name, None)
+        environment.update(
+            {
+                "GIT_CONFIG_COUNT": "3",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": "/dev/null",
+                "GIT_CONFIG_KEY_1": "core.fsmonitor",
+                "GIT_CONFIG_VALUE_1": "false",
+                "GIT_CONFIG_KEY_2": "protocol.ext.allow",
+                "GIT_CONFIG_VALUE_2": "never",
+            }
+        )
+        kwargs["env"] = environment
+        return self._delegate.run([str(self._git_executable), *argv[1:]], **kwargs)
 
 
 def checkout_root() -> Path:
@@ -110,6 +186,51 @@ def _git(
     description: str,
 ):
     return _run(runner, ["git", *args], repo=repo, description=description)
+
+
+_UNSAFE_LOCAL_GIT_CONFIG = (
+    r"^(core\.sshcommand|"
+    r"filter\..*\.(clean|smudge|process)|"
+    r"url\..*\.(insteadof|pushinsteadof))$"
+)
+
+
+def _require_safe_local_git_config(runner: CommandRunner, repo: Path) -> None:
+    """Reject local executable hooks and transport rewrites Git cannot safely wildcard-disable."""
+
+    try:
+        result = runner.run(
+            [
+                "git",
+                "config",
+                "--includes",
+                "--show-scope",
+                "--get-regexp",
+                _UNSAFE_LOCAL_GIT_CONFIG,
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise DownstreamUpdateError(
+            f"local Git configuration safety check could not start: {exc}"
+        ) from exc
+    if result.returncode == 1:
+        return
+    if result.returncode != 0:
+        raise DownstreamUpdateError("local Git configuration safety check failed")
+    unsafe_scopes = {"local", "worktree"}
+    if any(
+        line.split(maxsplit=1)[0] in unsafe_scopes
+        for line in _stdout(result).splitlines()
+        if line.split()
+    ):
+        raise DownstreamUpdateError(
+            "unsafe local Git configuration can execute code or redirect transport"
+        )
 
 
 def _stdout(result: Any) -> str:
@@ -202,7 +323,7 @@ def _require_remote(
     expected_slug: str,
     *,
     push: bool = False,
-) -> None:
+) -> str:
     args = ["remote", "get-url"]
     if push:
         args.extend(("--push", "--all"))
@@ -221,6 +342,7 @@ def _require_remote(
         raise DownstreamUpdateError(
             f"remote {remote} has wrong {kind}; expected GitHub {expected_slug}"
         )
+    return urls[0]
 
 
 def _os_release_values(path: Path) -> dict[str, str]:
@@ -339,22 +461,65 @@ def _restore_live_branch(runner: CommandRunner, config: UpdateConfig) -> None:
         raise
 
 
-def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
+def _preserve_transaction_error(
+    transaction_error: BaseException,
+    restoration_error: BaseException,
+) -> None:
+    """Keep the transaction failure primary while recording bounded restore detail."""
+
+    transaction_error.add_note(
+        "checkout state could not be proven/restored; inspect the checkout before retrying"
+    )
+    current: BaseException | None = restoration_error
+    seen: set[int] = set()
+    for attempt in range(1, 3):
+        if current is None or current is transaction_error or id(current) in seen:
+            break
+        seen.add(id(current))
+        transaction_error.add_note(
+            f"restoration failure {attempt}: {type(current).__name__}: {current}"
+        )
+        current = current.__cause__ or current.__context__
+
+
+def _sync_source(
+    runner: CommandRunner,
+    config: UpdateConfig,
+    checkout_identity: CheckoutIdentity | None = None,
+    upstream_fetch_url: str | None = None,
+    fork_fetch_url: str | None = None,
+    fork_push_url: str | None = None,
+) -> None:
     repo = config.repo
     branch = config.live_branch
+
+    def assert_checkout() -> None:
+        if checkout_identity is not None:
+            _assert_checkout_identity(checkout_identity)
+
+    def assert_safe_checkout() -> None:
+        assert_checkout()
+        _require_safe_local_git_config(runner, repo)
+
+    def restore_live_branch() -> None:
+        assert_safe_checkout()
+        _restore_live_branch(runner, config)
+
+    assert_safe_checkout()
     _git(
         runner,
         repo,
         "fetch",
-        config.upstream_remote,
+        upstream_fetch_url or config.upstream_remote,
         "+refs/heads/main:refs/remotes/upstream/main",
         description="fetch upstream/main",
     )
+    assert_safe_checkout()
     _git(
         runner,
         repo,
         "fetch",
-        config.fork_remote,
+        fork_fetch_url or config.fork_remote,
         "+refs/heads/main:refs/remotes/fork/main",
         f"+refs/heads/{branch}:refs/remotes/fork/{branch}",
         description=f"fetch fork/main and fork/{branch}",
@@ -388,6 +553,7 @@ def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
     )
 
     try:
+        assert_safe_checkout()
         _git(runner, repo, "checkout", "main", description="check out pristine main")
         _git(
             runner,
@@ -411,24 +577,41 @@ def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
         )
         if local_main != upstream_main:
             raise DownstreamUpdateError("local main does not exactly match upstream/main")
+        assert_safe_checkout()
         _git(
             runner,
             repo,
             "push",
-            config.fork_remote,
+            fork_push_url or config.fork_remote,
             f"{upstream_main}:refs/heads/main",
             description="publish pristine fork/main",
         )
-        fork_main = _remote_branch_sha(runner, config, "main")
+        assert_safe_checkout()
+        fork_main = _remote_branch_sha(
+            runner,
+            config,
+            "main",
+            remote_url=fork_push_url,
+        )
         if fork_main != upstream_main:
             raise DownstreamUpdateError(
                 f"fork/main {fork_main} does not match upstream/main {upstream_main}"
             )
-    finally:
+    except BaseException as transaction_error:
+        # A failed restoration must not replace the active transaction failure.
+        try:
+            restore_live_branch()
+        except BaseException as restoration_error:
+            _preserve_transaction_error(transaction_error, restoration_error)
+            raise transaction_error from restoration_error
+        raise
+    else:
         # BaseException-safe: interrupts after checkout must not strand the live checkout on main.
-        _restore_live_branch(runner, config)
+        restore_live_branch()
 
+    assert_safe_checkout()
     _require_branch(runner, repo, branch)
+    assert_safe_checkout()
     _git(
         runner,
         repo,
@@ -437,6 +620,7 @@ def _sync_source(runner: CommandRunner, config: UpdateConfig) -> None:
         "main",
         description=f"merge main into {branch}",
     )
+    assert_checkout()
     _require_branch(runner, repo, branch)
     _require_clean(runner, repo)
 
@@ -582,6 +766,8 @@ def _remote_branch_sha(
     runner: CommandRunner,
     config: UpdateConfig,
     branch: str,
+    *,
+    remote_url: str | None = None,
 ) -> str:
     ref = f"refs/heads/{branch}"
     result = _git(
@@ -590,7 +776,7 @@ def _remote_branch_sha(
         "ls-remote",
         "--exit-code",
         "--heads",
-        config.fork_remote,
+        remote_url or config.fork_remote,
         ref,
         description=f"read fork/{branch}",
     )
@@ -601,14 +787,45 @@ def _remote_branch_sha(
     raise DownstreamUpdateError(f"fork/{branch} did not return an exact branch ref")
 
 
-def _validate_checkout(command_runner: CommandRunner, config: UpdateConfig) -> Path:
+def _checkout_identity(repo: Path) -> CheckoutIdentity:
+    try:
+        metadata = os.stat(repo, follow_symlinks=False)
+    except OSError as exc:
+        raise DownstreamUpdateError(f"cannot inspect checkout identity: {exc}") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise DownstreamUpdateError("checkout identity is not a directory")
+    return CheckoutIdentity(repo, metadata.st_dev, metadata.st_ino)
+
+
+def _assert_checkout_identity(expected: CheckoutIdentity) -> None:
+    try:
+        resolved = expected.path.resolve(strict=True)
+        actual = _checkout_identity(expected.path)
+    except (OSError, RuntimeError, DownstreamUpdateError) as exc:
+        raise DownstreamUpdateError(f"checkout identity changed: {exc}") from exc
+    if resolved != expected.path or actual != expected:
+        raise DownstreamUpdateError("checkout identity changed after validation")
+
+
+def _validate_checkout(
+    command_runner: CommandRunner, config: UpdateConfig
+) -> tuple[CheckoutIdentity, str, str, str]:
     """Read-only checkout and transport validation performed under the transaction lock."""
-    repo = config.repo.resolve()
-    expected_repo = config.expected_repo.resolve()
+    requested_repo = Path(os.path.abspath(config.repo))
+    try:
+        repo = config.repo.resolve(strict=True)
+        expected_repo = config.expected_repo.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise DownstreamUpdateError(f"checkout path cannot be resolved: {exc}") from exc
+    if requested_repo != repo:
+        raise DownstreamUpdateError(
+            f"checkout path must be canonical and contain no symlink components: {config.repo}"
+        )
     if repo != expected_repo:
         raise DownstreamUpdateError(
             f"refusing unexpected checkout {repo}; expected {expected_repo}"
         )
+    identity = _checkout_identity(repo)
     actual_root = Path(
         _stdout(
             _git(
@@ -624,28 +841,39 @@ def _validate_checkout(command_runner: CommandRunner, config: UpdateConfig) -> P
         raise DownstreamUpdateError(
             f"Git top-level is {actual_root}; expected checkout {expected_repo}"
         )
+    _require_safe_local_git_config(command_runner, repo)
     _require_branch(command_runner, repo, config.live_branch)
     _require_clean(command_runner, repo)
-    _require_remote(
+    upstream_fetch_url = _require_remote(
         command_runner,
         repo,
         config.upstream_remote,
         config.upstream_slug,
     )
-    _require_remote(command_runner, repo, config.fork_remote, config.fork_slug)
-    _require_remote(
+    fork_fetch_url = _require_remote(
+        command_runner,
+        repo,
+        config.fork_remote,
+        config.fork_slug,
+    )
+    fork_push_url = _require_remote(
         command_runner,
         repo,
         config.fork_remote,
         config.fork_slug,
         push=True,
     )
-    return repo
+    _assert_checkout_identity(identity)
+    return identity, upstream_fetch_url, fork_fetch_url, fork_push_url
 
 
 def _run_update_transaction(
     config: UpdateConfig,
     *,
+    checkout_identity: CheckoutIdentity,
+    upstream_fetch_url: str,
+    fork_fetch_url: str,
+    fork_push_url: str,
     command_runner: CommandRunner,
     container: str,
     verify_artifacts: ArtifactVerifier,
@@ -660,13 +888,25 @@ def _run_update_transaction(
     """Run one validated, locked, and host-preflighted downstream transaction."""
     repo = config.repo.resolve()
 
+    def assert_checkout() -> None:
+        _assert_checkout_identity(checkout_identity)
+
     output("→ Synchronizing pristine main and downstream source")
-    _sync_source(command_runner, config)
+    assert_checkout()
+    _sync_source(
+        command_runner,
+        config,
+        checkout_identity=checkout_identity,
+        upstream_fetch_url=upstream_fetch_url,
+        fork_fetch_url=fork_fetch_url,
+        fork_push_url=fork_push_url,
+    )
     intended_sha = _stdout(
         _git(command_runner, repo, "rev-parse", "HEAD", description="pin downstream revision")
     )
 
     output("→ Synchronizing locked Python dependencies with runtime and dev extras")
+    assert_checkout()
     _run(
         command_runner,
         [config.uv_executable, "sync", "--locked", "--extra", "all", "--extra", "dev"],
@@ -678,6 +918,7 @@ def _run_update_transaction(
     npm = toolbox_npm_command(config.toolbox_executable, container)
 
     output("→ Synchronizing locked Node dependencies in Toolbx")
+    assert_checkout()
     _run(
         command_runner,
         [*npm, "ci", "--include=dev"],
@@ -687,6 +928,7 @@ def _run_update_transaction(
     )
 
     output("→ Running focused downstream updater tests")
+    assert_checkout()
     _run(
         command_runner,
         [
@@ -702,6 +944,7 @@ def _run_update_transaction(
         capture_output=False,
     )
     for workspace in ("web", "apps/desktop"):
+        assert_checkout()
         _run(
             command_runner,
             [*npm, "run", "typecheck", "--workspace", workspace],
@@ -711,6 +954,7 @@ def _run_update_transaction(
         )
 
     output("→ Building Web UI in Toolbx")
+    assert_checkout()
     _run(
         command_runner,
         [*npm, "run", "build", "--workspace", "web"],
@@ -720,6 +964,7 @@ def _run_update_transaction(
     )
 
     output("→ Building ARM64 Desktop through the shared Toolbx-aware path")
+    assert_checkout()
     _run(
         command_runner,
         [
@@ -729,6 +974,8 @@ def _run_update_transaction(
             "desktop",
             "--build-only",
             "--force-build",
+            "--toolbox-container",
+            container,
         ],
         repo=repo,
         description="ARM64 Desktop build",
@@ -744,37 +991,50 @@ def _run_update_transaction(
         raise DownstreamUpdateError(
             f"downstream HEAD moved during verification: {intended_sha} -> {local_sha}"
         )
+    assert_checkout()
     _gate("ARM64 artifact verification", lambda: verify_artifacts(command_runner, repo))
 
     output(f"→ Pushing {config.live_branch} without force")
+    assert_checkout()
+    _require_safe_local_git_config(command_runner, repo)
     _git(
         command_runner,
         repo,
         "push",
-        config.fork_remote,
+        fork_push_url,
         f"{intended_sha}:refs/heads/{config.live_branch}",
         description=f"push {config.live_branch}",
     )
-    remote_sha = _remote_branch_sha(command_runner, config, config.live_branch)
+    remote_sha = _remote_branch_sha(
+        command_runner,
+        config,
+        config.live_branch,
+        remote_url=fork_push_url,
+    )
     if remote_sha != intended_sha:
         raise DownstreamUpdateError(
             f"fork/{config.live_branch} {remote_sha} does not match local {intended_sha}"
         )
 
     output("→ Migrating and validating configuration")
+    assert_checkout()
     _gate("configuration gate", lambda: verify_config(command_runner, config))
     output("→ Verifying final CLI runtime revision identity")
+    assert_checkout()
     _gate(
         "runtime-identity gate",
         lambda: verify_runtime_identity(command_runner, config, intended_sha),
     )
+    assert_checkout()
     _verify_onecli(command_runner, config, onecli_service_ready)
+    assert_checkout()
     pre_restart = _gate(
         "pre-restart gateway receipt capture",
         lambda: capture_gateway_receipt(command_runner),
     )
     restart_started_at = restart_clock()
     output("→ Restarting gateway after all source, test, build, artifact, and push gates")
+    assert_checkout()
     _run(
         command_runner,
         [
@@ -815,23 +1075,50 @@ def run_update(
     verify_config: ConfigVerifier = _verify_config,
     verify_runtime_identity: RuntimeIdentityVerifier = _verify_runtime_identity,
     onecli_service_ready: OneCLIServiceReady = _onecli_local_service_ready,
+    resolve_git_executable: ExecutableResolver = shutil.which,
     output: Callable[[str], None] = print,
 ) -> str:
     """Run the complete single-writer downstream update transaction."""
-    command_runner: CommandRunner = runner if runner is not None else SubprocessRunner()
+    resolved_git = resolve_git_executable("git")
+    if not resolved_git:
+        raise DownstreamUpdateError("cannot resolve the Git executable before update")
+    try:
+        git_executable = Path(resolved_git).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise DownstreamUpdateError(f"cannot pin the Git executable: {exc}") from exc
+    if not git_executable.is_file() or not os.access(git_executable, os.X_OK):
+        raise DownstreamUpdateError("resolved Git executable is not an executable file")
+
+    delegate: CommandRunner = runner if runner is not None else SubprocessRunner()
+    command_runner: CommandRunner = SafeGitRunner(delegate, git_executable)
     with transaction_lock(config):
-        _validate_checkout(command_runner, config)
+        (
+            checkout_identity,
+            upstream_fetch_url,
+            fork_fetch_url,
+            fork_push_url,
+        ) = _validate_checkout(command_runner, config)
+        validated_config = replace(
+            config,
+            repo=checkout_identity.path,
+            expected_repo=checkout_identity.path,
+        )
         container = _gate(
             "Silverblue host and persistent Toolbx preflight",
             lambda: host_preflight(
                 command_runner,
-                config,
+                validated_config,
                 provision_toolbox,
                 output,
             ),
         )
+        _assert_checkout_identity(checkout_identity)
         return _run_update_transaction(
-            config,
+            validated_config,
+            checkout_identity=checkout_identity,
+            upstream_fetch_url=upstream_fetch_url,
+            fork_fetch_url=fork_fetch_url,
+            fork_push_url=fork_push_url,
             command_runner=command_runner,
             container=container,
             verify_artifacts=verify_artifacts,
@@ -904,6 +1191,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_update(UpdateConfig(repo=args.repo, expected_repo=expected))
     except DownstreamUpdateError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        for note in getattr(exc, "__notes__", ()):
+            print(f"note: {note}", file=sys.stderr)
         return 1
     return 0
 

@@ -1260,14 +1260,7 @@ def _validate_container_types(config: Dict[str, Any], issues: List[ConfigIssue])
         exists, value = _persisted_config_value(config, key)
         if not exists:
             continue
-        if (
-            kind == "list"
-            and key in _SCALAR_AS_ONE_ITEM_LIST_KEYS
-            and isinstance(value, str)
-        ):
-            continue
-        valid = isinstance(value, list) if kind == "list" else isinstance(value, dict)
-        if valid:
+        if _container_value_matches(key, kind, value):
             continue
         _issue(
             issues,
@@ -1283,7 +1276,7 @@ def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue
     exclusions silently lapse (#83308, #105706). Finding only — the file is never rewritten."""
     for key, kind in _container_slots().items():
         # ``parse_config_string_list`` readers accept the quoted form; nothing is ignored there.
-        if key in _SCALAR_AS_ONE_ITEM_LIST_KEYS:
+        if key in _SCALAR_CONTAINER_COMPAT_KEYS:
             continue
         value = cfg_get(config, *key.split("."))
         if not isinstance(value, str) or not _looks_structured_value(value):
@@ -3472,43 +3465,51 @@ _KNOWN_CONTAINER_TYPES = {
     # so without these rows `config set plugins.enabled foo` stored a string every reader ignored.
     "plugins.enabled": "list",
     "plugins.disabled": "list",
+    "plugins.entries": "mapping",
     "model_catalog.excluded_providers": "list",
 }
 # List slots whose readers go through ``parse_config_string_list``: a bare name is one entry.
 _SCALAR_AS_ONE_ITEM_LIST_KEYS = frozenset({"agent.disabled_toolsets", "skills.disabled"})
+# The runtime intentionally accepts ``model: <id>`` as shorthand for ``model.default``.
+_SCALAR_AS_MAPPING_KEYS = frozenset({"model"})
+_SCALAR_CONTAINER_COMPAT_KEYS = _SCALAR_AS_ONE_ITEM_LIST_KEYS | _SCALAR_AS_MAPPING_KEYS
+
+
+def _container_value_matches(key: str, kind: str, value: Any) -> bool:
+    """Whether *value* has the inventory shape or an intentional runtime shorthand."""
+    if isinstance(value, str) and key in _SCALAR_CONTAINER_COMPAT_KEYS:
+        return True
+    return isinstance(value, list) if kind == "list" else isinstance(value, dict)
 
 
 def _expected_container_type(key: str, user_config: Dict[str, Any]) -> Optional[str]:
-    """``"list"`` / ``"mapping"`` when the schema (``DEFAULT_CONFIG``, the known-container table,
-    or the value already on disk) fixes *key* to a container; ``None`` for scalars and open paths.
-    A single-segment key that is a mapping *section* in the schema skips the lookup: replacing a
-    whole section is ``_guard_section_overwrite``'s call (``--force``, the bare ``model`` shorthand)."""
-    parts = _split_key_path(key)
-    schema_node = cfg_get(DEFAULT_CONFIG, *parts)
-    if len(parts) == 1 and isinstance(schema_node, dict):
-        schema_node = None
+    """Return the authoritative declared shape, or an existing open-path container shape."""
+    declared = _container_slots().get(key)
+    if declared is not None:
+        return declared
     existing = _get_nested(user_config, key)
-    for node in (schema_node, _KNOWN_CONTAINER_TYPES.get(key), existing):
-        if isinstance(node, dict) or node == "mapping":
-            return "mapping"
-        if isinstance(node, list) or node == "list":
-            return "list"
+    if isinstance(existing, dict):
+        return "mapping"
+    if isinstance(existing, list):
+        return "list"
     return None
 
 
 def _refuse_container_type_mismatch(key: str, value: Any, user_config: Dict[str, Any], force: bool) -> Any:
     """Hard guardrail: never store a value of the wrong shape where the schema wants a list or a
-    mapping — every reader would ignore it while ``config get`` echoed it back. ``--force`` keeps
-    its documented meaning (replace a whole mapping section); a non-list in a list slot is never
-    readable, so it has no override. Returns the value to store: a bare name for a
+    mapping — every reader would ignore it while ``config get`` echoed it back. ``--force`` may
+    replace an existing open-path mapping, but cannot violate a declared runtime shape. Returns the
+    value to store: a bare name for a
     ``parse_config_string_list``-read slot becomes a one-item list."""
     expected = _expected_container_type(key, user_config)
     if expected is None:
         return value
     if expected == "list" and isinstance(value, str) and key in _SCALAR_AS_ONE_ITEM_LIST_KEYS:
         return [value]
-    ok = isinstance(value, list) if expected == "list" else isinstance(value, dict)
-    if ok or (expected == "mapping" and force):
+    if _container_value_matches(key, expected, value):
+        return value
+    declared = _container_slots().get(key)
+    if expected == "mapping" and force and declared is None:
         return value
     got = type(value).__name__ if not isinstance(value, str) else "string"
     literal = "[item, ...]" if expected == "list" else "{key: value}"
@@ -3664,8 +3665,8 @@ def set_config_value(key: str, value: str, force: bool = False):
     ``force`` writes a known key given under the wrong prefix (``gateway.discord.foo`` where
     ``discord.foo`` is known; otherwise refused — any other unknown path under a known section
     is written with a did-you-mean notice), skips the unknown-top-level-key notice AND
-    authorizes replacing a mapping section with a scalar. Without it, scalar writes over mappings are refused and bare ``model`` is redirected
-    to ``model.default``."""
+    authorizes replacing an open-path mapping with a scalar. Declared container slots retain their
+    runtime shape even with ``force``; bare ``model`` remains the documented scalar shorthand."""
     if is_managed():
         managed_error("set configuration values")
         return
@@ -3721,8 +3722,8 @@ def set_config_value(key: str, value: str, force: bool = False):
     _model_val = user_config.get("model")
     if key.strip().lower().startswith("model.") and isinstance(_model_val, str) and _model_val:
         user_config["model"] = {"default": _model_val}
-    key = _guard_section_overwrite(key, value, user_config, force)
     value = _refuse_container_type_mismatch(key, value, user_config, force)
+    key = _guard_section_overwrite(key, value, user_config, force)
     _old_provider = _model_val.get("provider") if isinstance(_model_val, dict) else None
     try:
         _set_nested(user_config, key, value)

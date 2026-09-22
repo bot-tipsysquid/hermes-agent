@@ -7,6 +7,7 @@ from hermes_cli.config import (
     DEFAULT_CONFIG,
     _EXTRA_KNOWN_ROOT_KEYS,
     _KNOWN_ROOT_KEYS,
+    _container_slots,
     validate_config_structure,
     ConfigIssue,
 )
@@ -218,3 +219,51 @@ class TestQuotedContainerValues:
             "plugins": {"enabled": ["a"]},
         })
         assert not [i for i in issues if "quoted string" in i.message]
+
+
+class TestKnownContainerShapes:
+    @pytest.mark.parametrize(
+        ("config", "key", "kind"),
+        [
+            ({"gateway": "scalar"}, "gateway", "mapping"),
+            ({"gateway": []}, "gateway", "mapping"),
+            ({"plugins": "scalar"}, "plugins", "mapping"),
+            ({"plugins": []}, "plugins", "mapping"),
+            ({"security": []}, "security", "mapping"),
+            ({"model_catalog": []}, "model_catalog", "mapping"),
+            ({"plugins": {"entries": "scalar"}}, "plugins.entries", "mapping"),
+            ({"plugins": {"entries": []}}, "plugins.entries", "mapping"),
+        ],
+    )
+    def test_minimal_raw_config_rejects_wrong_known_container_shape(
+        self, config, key, kind
+    ):
+        errors = [
+            issue.message
+            for issue in validate_config_structure(config)
+            if issue.severity == "error"
+        ]
+
+        assert any(key in message and f"YAML {kind}" in message for message in errors)
+
+    def test_authoritative_container_inventory_is_exhaustively_validated(self):
+        slots = _container_slots()
+        assert slots["plugins.entries"] == "mapping"
+
+        for key, kind in sorted(slots.items()):
+            value = [] if kind == "mapping" else {}
+            config = {}
+            node = config
+            parts = key.split(".")
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value
+
+            errors = [
+                issue.message
+                for issue in validate_config_structure(config)
+                if issue.severity == "error"
+            ]
+            assert any(
+                key in message and f"YAML {kind}" in message for message in errors
+            ), key

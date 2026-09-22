@@ -3,6 +3,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli import desktop_toolbox, main_desktop, main_web_build
 
 
@@ -117,6 +119,67 @@ def test_desktop_dependency_install_uses_toolbox_prefix(monkeypatch, tmp_path):
         "/usr/bin/toolbox", "run", "--container", "hermes-arm-build", "npm"]
     assert captured["cwd"] == tmp_path
     assert captured["kwargs"] == {"capture_output": False, "env": {"CI": "1"}}
+
+
+def test_forced_preflighted_toolbox_overrides_complete_host_toolchain(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(main_desktop, "_fedora_silverblue_without_host_make", lambda: False)
+    monkeypatch.setattr(
+        main_desktop.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}",
+    )
+
+    def verify_exact_toolbox(**kwargs):
+        captured.update(kwargs)
+        return desktop_toolbox.TOOLBOX_NAME
+
+    monkeypatch.setattr(desktop_toolbox, "ensure_desktop_toolbox", verify_exact_toolbox)
+
+    command = main_desktop._desktop_npm_command(
+        "/usr/bin/npm",
+        tmp_path,
+        toolbox_container=desktop_toolbox.TOOLBOX_NAME,
+    )
+
+    assert command == [
+        "/usr/bin/toolbox",
+        "run",
+        "--container",
+        desktop_toolbox.TOOLBOX_NAME,
+        "npm",
+    ]
+    from hermes_cli.main import PROJECT_ROOT
+
+    assert captured["project_root"] == PROJECT_ROOT
+    assert captured["allow_provision"] is False
+
+
+def test_forced_toolbox_name_must_match_supported_preflight_contract(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_desktop.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    with pytest.raises(RuntimeError, match="does not match.*hermes-arm-build"):
+        main_desktop._desktop_npm_command(
+            "/usr/bin/npm",
+            tmp_path,
+            toolbox_container="different-container",
+        )
+
+
+def test_forced_toolbox_fails_closed_when_container_is_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_desktop.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def unavailable(**_kwargs):
+        raise desktop_toolbox.ToolboxProvisionError("container unavailable")
+
+    monkeypatch.setattr(desktop_toolbox, "ensure_desktop_toolbox", unavailable)
+
+    with pytest.raises(RuntimeError, match="container unavailable"):
+        main_desktop._desktop_npm_command(
+            "/usr/bin/npm",
+            tmp_path,
+            toolbox_container=desktop_toolbox.TOOLBOX_NAME,
+        )
 
 
 def test_prefixed_npm_install_preserves_lockfile(monkeypatch, tmp_path):

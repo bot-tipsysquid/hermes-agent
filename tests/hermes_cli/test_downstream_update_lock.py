@@ -74,14 +74,31 @@ def test_stale_unlocked_file_is_reclaimed_without_deleting_lock_path(tmp_path):
     assert path.exists()
 
 
-def test_lock_fails_closed_when_owner_only_directory_cannot_be_proven(tmp_path):
+def test_default_lock_rejects_unsafe_preexisting_directory_without_chmod(tmp_path):
     path = _lock_path(tmp_path)
     path.parent.mkdir(mode=0o755)
     os.chmod(path.parent, 0o755)
 
     with pytest.raises(DownstreamUpdateLockError, match="owner-only|permissions"):
-        with UpdaterTransactionLock(path=path, repair_permissions=False):
+        with UpdaterTransactionLock(path=path):
             pass
+
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o755
+    assert not path.exists()
+
+
+def test_default_lock_rejects_unsafe_preexisting_file_without_chmod(tmp_path):
+    path = _lock_path(tmp_path)
+    path.parent.mkdir(mode=0o700)
+    path.write_text("pre-existing\n", encoding="utf-8")
+    os.chmod(path, 0o644)
+
+    with pytest.raises(DownstreamUpdateLockError, match="owner-only|permissions"):
+        with UpdaterTransactionLock(path=path):
+            pass
+
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
 
 def test_symlinked_lock_directory_is_rejected_without_chmodding_target(tmp_path):

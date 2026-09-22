@@ -41,6 +41,10 @@ def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
         "--force-build", action="store_true",
         help="Force a full rebuild even if the content stamp matches")
     gui_parser.add_argument(
+        "--toolbox-container",
+        help="Force install and packaging through this preverified Toolbx container",
+    )
+    gui_parser.add_argument(
         "--setup-tcc-identity", action="store_true",
         help="macOS only: create/import a self-signed code-signing certificate "
             "in the login keychain and point desktop.macos_signing_identity at "

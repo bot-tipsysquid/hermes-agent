@@ -105,6 +105,7 @@ def ensure_desktop_toolbox(
     project_root: Path,
     host_release: str | None = None,
     toolbox_executable: str | None = None,
+    allow_provision: bool = True,
     output: Callable[[str], None] = print,
 ) -> str:
     """Create, provision, and verify the persistent release-matched Desktop Toolbx.
@@ -122,6 +123,10 @@ def ensure_desktop_toolbox(
     listed = _run(command_runner, [toolbox, "list", "--containers"], timeout=15)
     _require_success(listed, "Toolbx inventory")
     if TOOLBOX_NAME not in _container_names(listed.stdout or ""):
+        if not allow_provision:
+            raise ToolboxProvisionError(
+                f"required Toolbx '{TOOLBOX_NAME}' is unavailable"
+            )
         output(f"  → Creating release-matched Toolbx '{TOOLBOX_NAME}'")
         created = _run(
             command_runner,
@@ -154,6 +159,10 @@ def ensure_desktop_toolbox(
     package_probe = _inside(toolbox, "rpm", "-q", "--quiet", *REQUIRED_PACKAGES)
     packages = _run(command_runner, package_probe, timeout=60)
     if packages.returncode != 0:
+        if not allow_provision:
+            raise ToolboxProvisionError(
+                f"required build packages are unavailable in Toolbx '{TOOLBOX_NAME}'"
+            )
         output(f"  → Installing required build packages in '{TOOLBOX_NAME}'")
         installed = _run(
             command_runner,

@@ -174,3 +174,58 @@ def test_bare_string_into_list_slot_absent_from_defaults_is_refused(user_home, c
             set_config_value(key, "a,b")
         assert "must be a list" in capsys.readouterr().err
     assert read_raw_config() in (None, {})
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("gateway", "not-a-mapping"),
+        ("gateway", "[]"),
+        ("plugins", "not-a-mapping"),
+        ("plugins", "[]"),
+        ("security", "not-a-mapping"),
+        ("security", "[]"),
+        ("model_catalog", "not-a-mapping"),
+        ("model_catalog", "[]"),
+        ("plugins.entries", "not-a-mapping"),
+        ("plugins.entries", "[]"),
+    ],
+)
+def test_absent_known_mapping_slots_reject_scalar_and_list_values(
+    user_home, capsys, key, value
+):
+    from hermes_cli.config import read_raw_config, set_config_value
+
+    with pytest.raises(SystemExit):
+        set_config_value(key, value)
+
+    assert "must be a mapping" in capsys.readouterr().err
+    assert read_raw_config() in (None, {})
+
+
+def test_container_mismatch_diagnostic_does_not_echo_rejected_value(user_home, capsys):
+    from hermes_cli.config import set_config_value
+
+    rejected = "opaque-sensitive-value-should-not-be-printed"
+    with pytest.raises(SystemExit):
+        set_config_value("gateway", rejected)
+
+    assert rejected not in capsys.readouterr().err
+
+
+def test_every_declared_container_slot_rejects_the_opposite_container_on_fresh_config(
+    user_home, capsys
+):
+    from hermes_cli.config import _container_slots, set_config_value
+
+    slots = _container_slots()
+    assert slots["plugins.entries"] == "mapping"
+
+    for key, kind in sorted(slots.items()):
+        opposite = "[]" if kind == "mapping" else "{}"
+        with pytest.raises(SystemExit, match="1"):
+            set_config_value(key, opposite)
+        error = capsys.readouterr().err
+        assert f"must be a {kind}" in error, key
+
+    assert not (user_home / "config.yaml").exists()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import struct
 from typing import Any
@@ -71,6 +72,7 @@ def arm64_bundle(tmp_path, monkeypatch):
         / "pty.node"
     )
     _write_elf(executable, _AARCH64)
+    executable.chmod(0o755)
     _write_elf(node_pty, _AARCH64)
     monkeypatch.setattr(verify, "_desktop_packaged_executable", lambda _desktop: executable)
     monkeypatch.setattr(
@@ -117,6 +119,74 @@ def test_missing_packaged_node_pty_fails_closed(arm64_bundle):
 
     with pytest.raises(verify.ArtifactVerificationError, match="node-pty.*missing"):
         verify.verify_arm64_update_artifacts(root)
+
+
+@pytest.mark.parametrize("target", ["app", "pty"])
+def test_symlinked_packaged_elf_is_rejected(arm64_bundle, tmp_path, target):
+    root, executable, node_pty = arm64_bundle
+    artifact = executable if target == "app" else node_pty
+    unrelated = tmp_path / f"unrelated-{target}"
+    _write_elf(unrelated, _AARCH64)
+    unrelated.chmod(0o755)
+    artifact.unlink()
+    artifact.symlink_to(unrelated)
+
+    with pytest.raises(verify.ArtifactVerificationError, match="symlink|cannot validate"):
+        verify.verify_arm64_update_artifacts(root)
+
+
+@pytest.mark.parametrize("target", ["app", "pty"])
+def test_non_regular_packaged_artifact_is_rejected(arm64_bundle, target):
+    root, executable, node_pty = arm64_bundle
+    artifact = executable if target == "app" else node_pty
+    artifact.unlink()
+    artifact.mkdir()
+
+    with pytest.raises(verify.ArtifactVerificationError, match="regular file"):
+        verify.verify_arm64_update_artifacts(root)
+
+
+def test_packaged_executable_must_stay_inside_release_root(arm64_bundle, tmp_path, monkeypatch):
+    root, _, _ = arm64_bundle
+    escaped = tmp_path / "escaped" / "hermes"
+    _write_elf(escaped, _AARCH64)
+    escaped.chmod(0o755)
+    monkeypatch.setattr(verify, "_desktop_packaged_executable", lambda _desktop: escaped)
+
+    with pytest.raises(verify.ArtifactVerificationError, match="outside.*release root"):
+        verify.verify_arm64_update_artifacts(root)
+
+
+def test_packaged_executable_requires_executable_mode(arm64_bundle):
+    root, executable, _ = arm64_bundle
+    executable.chmod(0o644)
+
+    with pytest.raises(verify.ArtifactVerificationError, match="executable mode"):
+        verify.verify_arm64_update_artifacts(root)
+
+
+def test_elf_parser_uses_opened_descriptor_when_path_is_replaced(
+    arm64_bundle, tmp_path
+):
+    root, executable, _ = arm64_bundle
+    displaced = tmp_path / "opened-original"
+    raced = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal raced
+        fd = os.open(path, flags, mode, dir_fd=dir_fd)
+        if not raced and path == executable.name and dir_fd is not None:
+            raced = True
+            executable.rename(displaced)
+            _write_elf(executable, _X86_64)
+            executable.chmod(0o755)
+        return fd
+
+    receipt = verify.verify_arm64_update_artifacts(root, open_file=racing_open)
+
+    assert raced
+    assert receipt.executable == executable
+    assert verify._elf_machine(executable) == _X86_64
 
 
 def test_truncated_elf64_header_fails_closed(tmp_path):

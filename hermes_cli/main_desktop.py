@@ -1427,9 +1427,16 @@ def _desktop_auto_ozone_platform_hint() -> Optional[str]:
     return "x11" if os.environ.get("DISPLAY") else None
 
 
-def _desktop_toolbox_build_container() -> str | None:
+def _desktop_toolbox_build_container(toolbox_container: str | None = None) -> str | None:
     """Provision and verify the named release-matched Desktop build Toolbx."""
-    if not _fedora_silverblue_without_host_make():
+    from hermes_cli.desktop_toolbox import TOOLBOX_NAME
+
+    forced = toolbox_container is not None
+    if forced and toolbox_container != TOOLBOX_NAME:
+        raise RuntimeError(
+            f"forced Desktop Toolbx {toolbox_container!r} does not match {TOOLBOX_NAME!r}"
+        )
+    if not forced and not _fedora_silverblue_without_host_make():
         return None
     toolbox = shutil.which("toolbox")
     if not toolbox:
@@ -1444,18 +1451,34 @@ def _desktop_toolbox_build_container() -> str | None:
     from hermes_cli.main import PROJECT_ROOT
 
     try:
-        return ensure_desktop_toolbox(
+        container = ensure_desktop_toolbox(
             runner=SubprocessRunner(),
             project_root=PROJECT_ROOT,
             toolbox_executable=toolbox,
+            allow_provision=not forced,
         )
+        if forced and container != toolbox_container:
+            raise RuntimeError(
+                f"verified Desktop Toolbx {container!r} differs from forced {toolbox_container!r}"
+            )
+        return container
     except ToolboxProvisionError as exc:
         raise RuntimeError(f"Desktop build Toolbx is not ready: {exc}") from exc
 
 
-def _desktop_npm_command(npm: str, project_root: Path) -> list[str]:
+def _desktop_npm_command(
+    npm: str,
+    project_root: Path,
+    *,
+    toolbox_container: str | None = None,
+) -> list[str]:
     """Resolve one npm command used by both dependency install and packaging."""
-    if container := _desktop_toolbox_build_container():
+    container = (
+        _desktop_toolbox_build_container(toolbox_container)
+        if toolbox_container is not None
+        else _desktop_toolbox_build_container()
+    )
+    if container:
         from hermes_cli.desktop_toolbox import toolbox_npm_command
 
         toolbox = shutil.which("toolbox")
@@ -1610,11 +1633,22 @@ def _promote_staged_desktop_app(desktop_dir: Path, staging_dir: Path) -> Path:
     return packaged_executable
 
 
-def _build_desktop_app(desktop_dir: Path, *, source_mode: bool, npm: str, env: dict) -> Optional[Path]:
+def _build_desktop_app(
+    desktop_dir: Path,
+    *,
+    source_mode: bool,
+    npm: str,
+    env: dict,
+    toolbox_container: str | None = None,
+) -> Optional[Path]:
     """npm-install + build the desktop app, stage-and-swapping the packaged tree. Returns the new
     packaged exe (None in source mode). Exits on unrecoverable failure with the previous app kept."""
     from hermes_cli.main import PROJECT_ROOT
-    npm_command = _desktop_npm_command(npm, PROJECT_ROOT)
+    npm_command = (
+        _desktop_npm_command(npm, PROJECT_ROOT, toolbox_container=toolbox_container)
+        if toolbox_container is not None
+        else _desktop_npm_command(npm, PROJECT_ROOT)
+    )
     _install_desktop_workspace_deps(npm, env, npm_command=npm_command)
 
     build_label = "source build" if source_mode else "packaged app"
@@ -1784,6 +1818,7 @@ def cmd_gui(args: argparse.Namespace):
     source_mode = getattr(args, "source", False)
     skip_build = getattr(args, "skip_build", False)
     force_build = getattr(args, "force_build", False)
+    toolbox_container = getattr(args, "toolbox_container", None)
 
     # macOS-only one-shot: create a self-signed code-signing identity so TCC
     # grants survive rebuilds, then exit without building/launching.
@@ -1815,7 +1850,14 @@ def cmd_gui(args: argparse.Namespace):
         )
     elif needs_build:
         # --force-build overrides the content-hash stamp and always rebuilds.
-        built = _build_desktop_app(desktop_dir, source_mode=source_mode, npm=npm, env=env)
+        assert npm is not None
+        built = _build_desktop_app(
+            desktop_dir,
+            source_mode=source_mode,
+            npm=npm,
+            env=env,
+            toolbox_container=toolbox_container,
+        )
         if not source_mode:
             packaged_executable = built
     else:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -59,6 +60,9 @@ class _GitRunner:
         interrupt_type: type[BaseException] = KeyboardInterrupt,
         runtime_identity_payload: object = _DEFAULT_JSON_PAYLOAD,
         post_build_mutation: str | None = None,
+        restoration_failures: list[BaseException] | None = None,
+        hostile_hook: bool = False,
+        unsafe_git_config: str | None = None,
     ) -> None:
         self.repo = repo.resolve()
         self.branch = branch
@@ -79,11 +83,17 @@ class _GitRunner:
         self.interrupt_type = interrupt_type
         self.runtime_identity_payload = runtime_identity_payload
         self.post_build_mutation = post_build_mutation
+        self.restoration_failures = list(restoration_failures or [])
+        self.hostile_hook = hostile_hook
+        self.unsafe_git_config = unsafe_git_config
+        self.hook_executed = False
+        self.fork_push_url = fork_url
         self.main_sha = "0" * 40
         self.downstream_sha = _INITIAL_DOWNSTREAM
         self.remote_main_sha = "0" * 40
         self.remote_downstream_sha = _INITIAL_DOWNSTREAM
         self.commands: list[tuple[str, ...]] = []
+        self.raw_commands: list[tuple[str, ...]] = []
         self.events: list[object] = []
 
     def _interrupt(self, point: str) -> None:
@@ -92,15 +102,32 @@ class _GitRunner:
         self.interrupt_at = None
         raise self.interrupt_type(point)
 
-    def run(self, command, **_kwargs):
-        argv = tuple(str(part) for part in command)
+    def run(self, command, **kwargs):
+        raw_argv = tuple(str(part) for part in command)
+        self.raw_commands.append(raw_argv)
+        argv = ("git", *raw_argv[1:]) if Path(raw_argv[0]).name == "git" else raw_argv
         self.commands.append(argv)
         self.events.append(argv)
         if self.fail_marker and any(self.fail_marker in part for part in argv):
             return _result(1, stderr=f"forced {self.fail_marker} failure")
 
         if argv[0] == "git":
+            environment = kwargs.get("env")
+            if self.hostile_hook:
+                count = int(environment.get("GIT_CONFIG_COUNT", "0")) if isinstance(environment, dict) else 0
+                config = {
+                    environment.get(f"GIT_CONFIG_KEY_{index}"): environment.get(
+                        f"GIT_CONFIG_VALUE_{index}"
+                    )
+                    for index in range(count)
+                } if isinstance(environment, dict) else {}
+                if config.get("core.hooksPath") != "/dev/null":
+                    self.hook_executed = True
             args = argv[1:]
+            if args and args[0] == "config" and "--get-regexp" in args:
+                if self.unsafe_git_config:
+                    return _result(stdout=f"{self.unsafe_git_config}\n")
+                return _result(1)
             if args == ("rev-parse", "--show-toplevel"):
                 return _result(stdout=f"{self.repo}\n")
             if args == ("branch", "--show-current"):
@@ -110,7 +137,12 @@ class _GitRunner:
                 return _result(stdout=" M tracked.py\n" if self.dirty else "")
             if args[:2] == ("remote", "get-url"):
                 remote = args[-1]
-                url = self.upstream_url if remote == "upstream" else self.fork_url
+                if remote == "upstream":
+                    url = self.upstream_url
+                elif "--push" in args:
+                    url = self.fork_push_url
+                else:
+                    url = self.fork_url
                 return _result(stdout=f"{url}\n")
             if args[0] == "fetch":
                 return _result()
@@ -125,6 +157,8 @@ class _GitRunner:
                 target = args[1]
                 if target == "ken/downstream":
                     self._interrupt("checkout-downstream-before")
+                    if self.restoration_failures:
+                        raise self.restoration_failures.pop(0)
                 self.branch = target
                 self._interrupt(f"checkout-{target}-after")
                 return _result()
@@ -179,6 +213,13 @@ class _GitRunner:
                 self.dirty = True
             elif self.post_build_mutation == "sha":
                 self.downstream_sha = "3" * 40
+            elif self.post_build_mutation == "fork-push-url":
+                self.fork_push_url = "ssh://git@redirect.invalid/attacker/repo.git"
+            elif self.post_build_mutation == "url-rewrite":
+                self.unsafe_git_config = (
+                    "worktree\turl.ssh://git@redirect.invalid/.pushinsteadof "
+                    "ssh://git@github.com/"
+                )
             return _result()
         if argv[:3] == ("python", "-m", "hermes_cli.downstream_update"):
             payload = self.runtime_identity_payload
@@ -234,6 +275,8 @@ def _gateway_verifier(
 
 
 def _run(runner: _GitRunner, **overrides):
+    config = overrides.pop("config", _config(runner.repo))
+
     @contextmanager
     def transaction_lock(_config):
         runner.events.append("lock-acquired")
@@ -285,7 +328,7 @@ def _run(runner: _GitRunner, **overrides):
         "output": lambda _line: None,
     }
     kwargs.update(overrides)
-    return run_update(_config(runner.repo), **kwargs)
+    return run_update(config, **kwargs)
 
 
 def _index(commands: list[tuple[str, ...]], expected: tuple[str, ...]) -> int:
@@ -304,6 +347,155 @@ def _pushed_branch(runner: _GitRunner, branch: str) -> bool:
     )
 
 
+def test_rejects_symlink_checkout_alias_before_git_or_host_preflight(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    alias = tmp_path / "checkout-alias"
+    alias.symlink_to(checkout, target_is_directory=True)
+    runner = _GitRunner(checkout)
+    config = replace(_config(checkout), repo=alias)
+
+    with pytest.raises(DownstreamUpdateError, match="canonical|symlink"):
+        _run(runner, config=config)
+
+    assert runner.commands == []
+    assert "host-ready" not in runner.events
+
+
+def test_checkout_replacement_after_preflight_fails_before_fetch_or_mutation(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    displaced = tmp_path / "displaced-checkout"
+    runner = _GitRunner(checkout)
+
+    def replacing_preflight(_runner, _config, _provision_toolbox, _output):
+        checkout.rename(displaced)
+        checkout.mkdir()
+        return "hermes-arm-build"
+
+    with pytest.raises(DownstreamUpdateError, match="checkout identity changed"):
+        _run(runner, host_preflight=replacing_preflight)
+
+    assert not any(command[1:2] in (("fetch",), ("push",)) for command in runner.commands)
+    assert not _ran_uv_sync(runner)
+    assert not any("build" in command for command in runner.commands)
+    assert not any("restart" in command for command in runner.commands)
+
+
+def test_checkout_replacement_during_first_fetch_blocks_the_next_mutation(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    displaced = tmp_path / "displaced-checkout"
+
+    class ReplacingRunner(_GitRunner):
+        replaced = False
+
+        def run(self, command, **kwargs):
+            result = super().run(command, **kwargs)
+            normalized = tuple(str(part) for part in command)
+            if (
+                not self.replaced
+                and Path(normalized[0]).name == "git"
+                and normalized[1:2] == ("fetch",)
+            ):
+                checkout.rename(displaced)
+                checkout.mkdir()
+                self.replaced = True
+            return result
+
+    runner = ReplacingRunner(checkout)
+
+    with pytest.raises(DownstreamUpdateError, match="checkout identity changed"):
+        _run(runner)
+
+    fetches = [command for command in runner.commands if command[1:2] == ("fetch",)]
+    assert len(fetches) == 1
+    assert not _pushed_branch(runner, "main")
+    assert not _ran_uv_sync(runner)
+
+
+def test_mutated_fork_push_url_cannot_redirect_publication(tmp_path):
+    runner = _GitRunner(tmp_path, post_build_mutation="fork-push-url")
+
+    _run(runner)
+
+    pushes = [
+        command
+        for command in runner.raw_commands
+        if Path(command[0]).name == "git" and command[1:2] == ("push",)
+    ]
+    assert len(pushes) == 2
+    assert all(command[2] == _FORK_URL for command in pushes)
+    assert all("redirect.invalid" not in part for command in pushes for part in command)
+
+
+def test_updater_owned_git_commands_disable_repository_hooks(tmp_path):
+    runner = _GitRunner(tmp_path, hostile_hook=True)
+
+    _run(runner)
+
+    assert not runner.hook_executed
+
+
+@pytest.mark.parametrize(
+    "unsafe_config",
+    [
+        "local\tcore.sshcommand /tmp/hostile-ssh",
+        "local\tfilter.hostile.process /tmp/hostile-filter",
+        "worktree\turl.ssh://git@redirect.invalid/.insteadof ssh://git@github.com/",
+    ],
+)
+def test_executable_or_redirecting_local_git_config_fails_before_fetch(
+    tmp_path, unsafe_config
+):
+    runner = _GitRunner(tmp_path, unsafe_git_config=unsafe_config)
+
+    with pytest.raises(DownstreamUpdateError, match="unsafe local Git configuration"):
+        _run(runner)
+
+    assert not any(command[1:2] == ("fetch",) for command in runner.commands)
+    assert not _pushed_branch(runner, "main")
+
+
+def test_post_validation_url_rewrite_fails_before_downstream_publication(tmp_path):
+    runner = _GitRunner(tmp_path, post_build_mutation="url-rewrite")
+
+    with pytest.raises(DownstreamUpdateError, match="unsafe local Git configuration"):
+        _run(runner)
+
+    assert _pushed_branch(runner, "main")
+    assert not _pushed_branch(runner, "ken/downstream")
+    assert not any("restart" in command for command in runner.commands)
+
+
+def test_git_executable_is_resolved_once_before_path_mutation(tmp_path, monkeypatch):
+    runner = _GitRunner(tmp_path)
+    resolutions: list[str] = []
+    trusted_git = shutil.which("git")
+    assert trusted_git is not None
+
+    def resolve_git(name: str) -> str:
+        resolutions.append(name)
+        return trusted_git
+
+    def mutate_path(_runner, _config, _provision_toolbox, _output):
+        monkeypatch.setenv("PATH", "/attacker/bin")
+        return "hermes-arm-build"
+
+    _run(
+        runner,
+        host_preflight=mutate_path,
+        resolve_git_executable=resolve_git,
+    )
+
+    git_commands = [
+        command for command in runner.raw_commands if Path(command[0]).name == "git"
+    ]
+    assert resolutions == ["git"]
+    assert git_commands
+    assert all(command[0] == str(Path(trusted_git).resolve()) for command in git_commands)
+
+
 def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_builds_pushes_and_restarts(
     tmp_path,
 ):
@@ -315,11 +507,11 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
     checkout_main = _index(runner.commands, ("git", "checkout", "main"))
     push_main = _index(
         runner.commands,
-        ("git", "push", "fork", f"{_UPSTREAM_SHA}:refs/heads/main"),
+        ("git", "push", _FORK_URL, f"{_UPSTREAM_SHA}:refs/heads/main"),
     )
     readback_main = _index(
         runner.commands,
-        ("git", "ls-remote", "--exit-code", "--heads", "fork", "refs/heads/main"),
+        ("git", "ls-remote", "--exit-code", "--heads", _FORK_URL, "refs/heads/main"),
     )
     checkout_downstream = _index(runner.commands, ("git", "checkout", "ken/downstream"))
     python_sync = _index(
@@ -348,9 +540,13 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
         for i, command in enumerate(runner.commands)
         if command[:3] == ("python", "-m", "hermes_cli.main") and "desktop" in command
     )
+    assert runner.commands[desktop_build][-2:] == (
+        "--toolbox-container",
+        "hermes-arm-build",
+    )
     push_downstream = _index(
         runner.commands,
-        ("git", "push", "fork", f"{_UPDATED_DOWNSTREAM}:refs/heads/ken/downstream"),
+        ("git", "push", _FORK_URL, f"{_UPDATED_DOWNSTREAM}:refs/heads/ken/downstream"),
     )
     restart = _index(
         runner.commands,
@@ -412,12 +608,12 @@ def test_happy_path_orders_every_externally_significant_gate(tmp_path):
             (
                 "git",
                 "fetch",
-                "upstream",
+                _UPSTREAM_URL,
                 "+refs/heads/main:refs/remotes/upstream/main",
             )
         ),
         position(
-            ("git", "push", "fork", f"{_UPSTREAM_SHA}:refs/heads/main")
+            ("git", "push", _FORK_URL, f"{_UPSTREAM_SHA}:refs/heads/main")
         ),
         position(
             (
@@ -425,7 +621,7 @@ def test_happy_path_orders_every_externally_significant_gate(tmp_path):
                 "ls-remote",
                 "--exit-code",
                 "--heads",
-                "fork",
+                _FORK_URL,
                 "refs/heads/main",
             )
         ),
@@ -495,6 +691,8 @@ def test_happy_path_orders_every_externally_significant_gate(tmp_path):
                 "desktop",
                 "--build-only",
                 "--force-build",
+                "--toolbox-container",
+                "hermes-arm-build",
             )
         ),
         position(branch_probe, -1),
@@ -505,7 +703,7 @@ def test_happy_path_orders_every_externally_significant_gate(tmp_path):
             (
                 "git",
                 "push",
-                "fork",
+                _FORK_URL,
                 f"{_UPDATED_DOWNSTREAM}:refs/heads/ken/downstream",
             )
         ),
@@ -515,7 +713,7 @@ def test_happy_path_orders_every_externally_significant_gate(tmp_path):
                 "ls-remote",
                 "--exit-code",
                 "--heads",
-                "fork",
+                _FORK_URL,
                 "refs/heads/ken/downstream",
             )
         ),
@@ -949,6 +1147,55 @@ def test_restore_double_failure_preserves_original_and_reports_restore_failure(
     notes = getattr(excinfo.value, "__notes__", [])
     assert any(type(restoration_error).__name__ in note for note in notes)
     assert runner.checkout_calls <= 2
+
+
+def test_run_update_keeps_outer_keyboard_interrupt_primary_when_both_restores_fail(
+    tmp_path,
+):
+    first_restore = RuntimeError("first restoration checkout failed")
+    second_restore = SystemExit("second restoration checkout failed")
+    runner = _GitRunner(
+        tmp_path,
+        interrupt_at="push-main",
+        interrupt_type=KeyboardInterrupt,
+        restoration_failures=[first_restore, second_restore],
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="push-main") as excinfo:
+        _run(runner)
+
+    assert excinfo.value.__cause__ is first_restore
+    notes = "\n".join(getattr(excinfo.value, "__notes__", []))
+    assert "checkout state could not be proven/restored" in notes
+    assert "first restoration checkout failed" in notes
+    assert "second restoration checkout failed" in notes
+    assert not _ran_uv_sync(runner)
+
+
+def test_cli_prints_restore_failures_for_ordinary_transaction_error(
+    tmp_path, monkeypatch, capsys
+):
+    runner = _GitRunner(
+        tmp_path,
+        main_push_mismatch=True,
+        restoration_failures=[
+            RuntimeError("first restoration checkout failed"),
+            RuntimeError("second restoration checkout failed"),
+        ],
+    )
+
+    monkeypatch.setattr(
+        updater,
+        "run_update",
+        lambda _requested: updater._sync_source(runner, _config(tmp_path)),
+    )
+
+    assert main(["--repo", str(tmp_path)]) == 1
+    error = capsys.readouterr().err
+    assert "fork/main" in error and "does not match" in error
+    assert "checkout state could not be proven/restored" in error
+    assert "first restoration checkout failed" in error
+    assert "second restoration checkout failed" in error
 
 
 @pytest.mark.parametrize("gate", ["config", "runtime-identity"])

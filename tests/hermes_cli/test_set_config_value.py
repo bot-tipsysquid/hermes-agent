@@ -756,18 +756,19 @@ class TestMappingGuard:
             set_config_value("terminal", "zsh")
         assert exc.value.code == 1
 
-    def test_non_model_mapping_force_overwrites(self, _isolated_hermes_home):
-        """hermes config set --force terminal bash → proceed, section wiped."""
+    def test_non_model_mapping_force_cannot_bypass_schema_shape(self, _isolated_hermes_home):
+        """--force cannot make a runtime mapping slot unreadable."""
         self._write_config(_isolated_hermes_home, {
             "terminal": {
                 "backend": "docker",
                 "shell": "bash",
             }
         })
-        set_config_value("terminal", "zsh", force=True)
+        with pytest.raises(SystemExit):
+            set_config_value("terminal", "zsh", force=True)
         import yaml as _yaml
         parsed = _yaml.safe_load(_read_config(_isolated_hermes_home))
-        assert parsed["terminal"] == "zsh"
+        assert parsed["terminal"] == {"backend": "docker", "shell": "bash"}
 
     def test_model_default_dotted_path_is_not_guarded(self, _isolated_hermes_home):
         """model.default is already a dotted path — guard must not fire."""
@@ -1082,13 +1083,13 @@ class TestContainerTypeRefusal:
         set_config_value("model.default", "bar")
         with pytest.raises(SystemExit):
             set_config_value("model.aliases", "notamap")
-        # --force keeps its documented meaning: replace a whole mapping section.
-        set_config_value("model.aliases", "replaced", force=True)
+        with pytest.raises(SystemExit):
+            set_config_value("model.aliases", "replaced", force=True)
 
         import yaml as _yaml
         saved = _yaml.safe_load(_read_config(_isolated_hermes_home))
         assert saved["custom_providers"] == [{"name": "ok", "base_url": "http://h/v1"}]
-        assert saved["model"] == {"default": "bar", "aliases": "replaced"}
+        assert saved["model"] == {"default": "bar", "aliases": {"a": "p/m"}}
 
     @pytest.mark.parametrize("key", ["model.aliases", "providers", "toolsets"])
     def test_unseeded_or_top_level_container_key_is_refused_without_on_disk_value(
