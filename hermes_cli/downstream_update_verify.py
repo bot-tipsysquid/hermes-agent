@@ -259,46 +259,34 @@ def capture_gateway_receipt_identity(
     *,
     state_path: Path | None = None,
     process_start_time: ProcessStartTime = _default_process_start_time,
-    start_times_match: StartTimesMatch = _default_start_times_match,
-    process_identity_matches: ProcessIdentityMatches = _default_process_identity_matches,
     live_gateway_pid: LiveGatewayPid = _default_live_gateway_pid,
 ) -> GatewayReceiptIdentity:
-    """Capture the existing receipt and its live gateway incarnation before restart."""
+    """Capture receipt fields and the independently discovered live gateway incarnation."""
     path = _gateway_state_path(state_path)
+    live_pid = live_gateway_pid(path.parent)
+    live_incarnation: tuple[int, object] | None = None
+    if live_pid is not None:
+        live_start = process_start_time(live_pid)
+        if live_start is None:
+            raise GatewayVerificationError(
+                "cannot capture pre-restart gateway process-start fingerprint"
+            )
+        live_incarnation = (live_pid, live_start)
+
     payload = _read_gateway_receipt(path)
     if not isinstance(payload, dict):
         if path.exists():
             raise GatewayVerificationError(
                 f"cannot capture pre-restart gateway receipt: {path} is unreadable or malformed"
             )
-        live_pid = live_gateway_pid(path.parent)
-        if live_pid is None:
-            return GatewayReceiptIdentity(None, None, None, None)
-        live_start = process_start_time(live_pid)
-        if live_start is None:
-            raise GatewayVerificationError(
-                "cannot capture pre-restart gateway process-start fingerprint"
-            )
-        return GatewayReceiptIdentity(None, None, None, (live_pid, live_start))
+        return GatewayReceiptIdentity(None, None, None, live_incarnation)
 
     receipt = cast(dict[str, object], payload)
     raw_pid = receipt.get("pid")
     pid = raw_pid if isinstance(raw_pid, int) and raw_pid > 0 else None
-    recorded_start = receipt.get("start_time")
-    live_incarnation: tuple[int, object] | None = None
-    if pid is not None and recorded_start is not None:
-        live_start = process_start_time(pid)
-        if live_start is not None:
-            try:
-                start_matches = start_times_match(recorded_start, live_start)
-            except (TypeError, ValueError, OverflowError):
-                start_matches = False
-            if start_matches and process_identity_matches(receipt, pid, path.parent):
-                live_incarnation = (pid, live_start)
-
     return GatewayReceiptIdentity(
         pid=pid,
-        start_time=recorded_start,
+        start_time=receipt.get("start_time"),
         updated_at=receipt.get("updated_at"),
         live_incarnation=live_incarnation,
     )

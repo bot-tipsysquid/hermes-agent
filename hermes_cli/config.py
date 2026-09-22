@@ -1003,16 +1003,21 @@ def check_config_version(*, raise_on_parse_error: bool = False) -> Tuple[int, in
     if not config_path.exists():
         return latest, latest
 
+    parse_failed = False
+    config: Any = None
     try:
         with open(config_path, encoding="utf-8") as f:
             config = fast_safe_load(f)
-    except Exception as e:
-        _warn_config_parse_failure(config_path, e)
-        if raise_on_parse_error:
-            raise InvalidUserConfigError(
-                f"Cannot inspect {config_path}: config.yaml is not valid YAML ({e})"
-            ) from e
-        return latest, latest
+    except Exception as exc:
+        if not raise_on_parse_error:
+            _warn_config_parse_failure(config_path, exc)
+            return latest, latest
+        parse_failed = True
+
+    if parse_failed:
+        raise InvalidUserConfigError(
+            f"Cannot inspect {config_path}: config.yaml is not valid YAML"
+        )
 
     if config is None:
         config = {}  # empty file / bare document: valid first-run state
@@ -1104,7 +1109,7 @@ def _validate_voice(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
     submit_mode = voice_cfg.get("submit_mode")
     normalized = submit_mode.strip().lower() if isinstance(submit_mode, str) else None
     if normalized not in {"direct", "draft"}:
-        _issue(issues, "error", f"voice.submit_mode must be 'direct' or 'draft', got {submit_mode!r}",
+        _issue(issues, "error", "voice.submit_mode must be 'direct' or 'draft'",
                "Set voice.submit_mode to direct (submit immediately) or draft (edit before sending)")
 
 
@@ -1125,7 +1130,7 @@ def _validate_timezone(config: Dict[str, Any], issues: List[ConfigIssue]) -> Non
             "schedules silently fall back to server-local time. HERMES_TIMEZONE overrides "
             "this key when set.")
     if tz is not None and not isinstance(tz, str):
-        _issue(issues, "error", f"timezone must be an IANA zone name string, got {tz!r}", hint)
+        _issue(issues, "error", "timezone must be an IANA zone name string", hint)
         return
     if not (isinstance(tz, str) and tz.strip()):
         return
@@ -1138,7 +1143,7 @@ def _validate_timezone(config: Dict[str, Any], issues: List[ConfigIssue]) -> Non
     try:
         zoneinfo.ZoneInfo(name)
     except Exception:
-        _issue(issues, "error", f"timezone {name!r} is not a valid IANA zone name", hint)
+        _issue(issues, "error", "timezone is not a valid IANA zone name", hint)
 
 
 def _validate_entry_list(
@@ -1213,7 +1218,7 @@ def _validate_web_backends(config: Dict[str, Any], issues: List[ConfigIssue]) ->
         note = removed_backend_note("web", _val)
         if note:
             _issue(issues, "warning",
-                   f"web.{_key} is set to '{_val}', but {note} — "
+                   f"web.{_key} selects a backend that is no longer available — "
                    "web_search/web_extract will fail until it is changed",
                    "Run 'hermes tools' and pick a different Web Search & Extract provider")
 
@@ -1235,6 +1240,41 @@ def _container_slots() -> Dict[str, str]:
     walk(DEFAULT_CONFIG, "")
     slots.update(_KNOWN_CONTAINER_TYPES)
     return slots
+
+
+def _persisted_config_value(
+    config: Dict[str, Any], dotted_path: str
+) -> tuple[bool, Any]:
+    """Return whether *dotted_path* exists in the persisted mapping and its value."""
+    node: Any = config
+    for segment in dotted_path.split("."):
+        if not isinstance(node, dict) or segment not in node:
+            return False, None
+        node = node[segment]
+    return True, node
+
+
+def _validate_container_types(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
+    """Require every persisted schema container slot to retain its declared shape."""
+    for key, kind in _container_slots().items():
+        exists, value = _persisted_config_value(config, key)
+        if not exists:
+            continue
+        if (
+            kind == "list"
+            and key in _SCALAR_AS_ONE_ITEM_LIST_KEYS
+            and isinstance(value, str)
+        ):
+            continue
+        valid = isinstance(value, list) if kind == "list" else isinstance(value, dict)
+        if valid:
+            continue
+        _issue(
+            issues,
+            "error",
+            f"{key} must be a YAML {kind}; the persisted value has the wrong type",
+            f"Replace {key} with a YAML {kind}, or remove it to use the default",
+        )
 
 
 def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
@@ -1299,6 +1339,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Move '{key}' under the appropriate section")
 
     _validate_web_backends(config, issues)
+    _validate_container_types(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
 
@@ -1313,16 +1354,16 @@ def validate_config_strict() -> None:
     """
     latest_version = _coerce_config_version(DEFAULT_CONFIG.get("_config_version", 1)) or 1
     config_path = get_config_path()
+    raw_config: Dict[str, Any] = {}
+    current_version = latest_version
+    parse_failed = False
     try:
         with open(config_path, encoding="utf-8") as config_file:
             loaded = fast_safe_load(config_file)
     except FileNotFoundError:
-        raw_config: Dict[str, Any] = {}
-        current_version = latest_version
-    except Exception as exc:
-        raise InvalidUserConfigError(
-            f"Cannot inspect {config_path}: config.yaml is not valid YAML ({exc})"
-        ) from exc
+        pass
+    except Exception:
+        parse_failed = True
     else:
         if loaded is None:
             raw_config = {}
@@ -1334,6 +1375,11 @@ def validate_config_strict() -> None:
         else:
             raw_config = loaded
         current_version = _coerce_config_version(raw_config.get("_config_version"))
+
+    if parse_failed:
+        raise InvalidUserConfigError(
+            f"Cannot inspect {config_path}: config.yaml is not valid YAML"
+        )
 
     from hermes_cli.config_migrations import SUPPORT_FLOOR_VERSION, support_floor_message
 
@@ -1347,7 +1393,7 @@ def validate_config_strict() -> None:
     failures: List[str] = []
     if current_version != latest_version:
         failures.append(
-            f"config version {current_version} is not current; version {latest_version} is required"
+            f"_config_version is not current; version {latest_version} is required"
         )
 
     failures.extend(issue.message for issue in validate_config_structure(raw_config))
@@ -3406,6 +3452,19 @@ def _coerce_config_set_value(key: str, value: str) -> Any:
 # so the guardrail holds before anything is on disk (#114471: `model.aliases notamap`).
 _KNOWN_CONTAINER_TYPES = {
     "custom_providers": "list",
+    "mcp_servers": "mapping",
+    "image_gen": "mapping",
+    "video_gen": "mapping",
+    "smart_model_routing": "mapping",
+    "platform_toolsets": "mapping",
+    "known_plugin_toolsets": "mapping",
+    "known_builtin_toolsets": "mapping",
+    "tool_gateway_declined_tools": "list",
+    "profile_routes": "list",
+    "platforms": "mapping",
+    "signal": "mapping",
+    "timeouts": "mapping",
+    "reset_triggers": "list",
     "providers": "mapping",
     "model.aliases": "mapping",
     "model_aliases": "mapping",

@@ -925,8 +925,166 @@ class TestStrictConfigValidation:
             "check_config_version",
             return_value=(DEFAULT_CONFIG["_config_version"], DEFAULT_CONFIG["_config_version"]),
         ):
-            with pytest.raises(InvalidUserConfigError, match="version 12 is not current"):
+            with pytest.raises(InvalidUserConfigError, match="_config_version is not current"):
                 self._validate(tmp_path)
+
+    @pytest.mark.parametrize(
+        ("body", "path", "expected"),
+        [
+            ("gateway: definitely-not-a-map\n", "gateway", "mapping"),
+            ("gateway: []\n", "gateway", "mapping"),
+            ("plugins:\n  enabled: definitely-not-a-list\n", "plugins.enabled", "list"),
+            ("plugins:\n  enabled: {}\n", "plugins.enabled", "list"),
+            ("gateway:\n  profile_routes: {}\n", "gateway.profile_routes", "list"),
+            ("mcp_servers: definitely-not-a-map\n", "mcp_servers", "mapping"),
+            ("image_gen: []\n", "image_gen", "mapping"),
+            ("platform_toolsets: no\n", "platform_toolsets", "mapping"),
+            ("tool_gateway_declined_tools: {}\n", "tool_gateway_declined_tools", "list"),
+            ("profile_routes: {}\n", "profile_routes", "list"),
+            ("platforms: []\n", "platforms", "mapping"),
+            ("signal: disabled\n", "signal", "mapping"),
+            ("timeouts: []\n", "timeouts", "mapping"),
+        ],
+    )
+    def test_rejects_wrong_known_container_slot_type(
+        self, tmp_path, body, path, expected
+    ):
+        self._write(
+            tmp_path,
+            f'_config_version: {DEFAULT_CONFIG["_config_version"]}\n{body}',
+        )
+
+        with pytest.raises(InvalidUserConfigError) as exc_info:
+            self._validate(tmp_path)
+
+        assert f"{path} must be a YAML {expected}" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("body", "marker", "expected_reason"),
+        [
+            (
+                "fallback_model: TMM420_SCALAR_SECRET_8f5c\n",
+                "TMM420_SCALAR_SECRET_8f5c",
+                "fallback_model",
+            ),
+            (
+                "providers: TMM420_CONTAINER_SECRET_a137\n",
+                "TMM420_CONTAINER_SECRET_a137",
+                "providers",
+            ),
+            (
+                "timezone: TMM420_TIMEZONE_SECRET_c429\n",
+                "TMM420_TIMEZONE_SECRET_c429",
+                "timezone",
+            ),
+            (
+                "voice:\n  submit_mode: TMM420_VOICE_SECRET_d732\n",
+                "TMM420_VOICE_SECRET_d732",
+                "voice.submit_mode",
+            ),
+            (
+                "web:\n  backend: TMM420_WEB_SECRET_e841\n",
+                "TMM420_WEB_SECRET_e841",
+                "web.backend",
+            ),
+        ],
+    )
+    def test_strict_diagnostics_never_echo_invalid_values(
+        self, tmp_path, monkeypatch, body, marker, expected_reason
+    ):
+        from tools import tool_backend_helpers
+
+        monkeypatch.setattr(
+            tool_backend_helpers,
+            "removed_backend_note",
+            lambda _section, _name: "the selected backend is unavailable",
+        )
+        self._write(
+            tmp_path,
+            f'_config_version: {DEFAULT_CONFIG["_config_version"]}\n{body}',
+        )
+
+        with pytest.raises(InvalidUserConfigError) as exc_info:
+            self._validate(tmp_path)
+
+        diagnostic = str(exc_info.value)
+        assert marker.lower() not in diagnostic.lower()
+        assert expected_reason in diagnostic
+
+    def test_validate_command_and_yaml_diagnostic_do_not_echo_document_content(
+        self, tmp_path, capsys
+    ):
+        from argparse import Namespace
+
+        from hermes_cli import config as config_module
+        from hermes_cli.config import config_command
+
+        marker = "TMM420_YAML_SECRET_f950"
+        self._write(tmp_path, "model: [unterminated\n")
+        with patch.object(
+            config_module,
+            "fast_safe_load",
+            side_effect=ValueError(f"parser saw {marker}"),
+        ):
+            with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+                with pytest.raises(SystemExit) as exc_info:
+                    config_command(Namespace(config_command="validate"))
+
+        captured = capsys.readouterr()
+        assert exc_info.value.code == 1
+        assert marker not in str(exc_info.value)
+        assert marker not in captured.out
+        assert marker not in captured.err
+        assert "config.yaml is not valid YAML" in captured.err
+
+    def test_yaml_parser_failure_drops_sensitive_exception_cause(self, tmp_path):
+        from hermes_cli import config as config_module
+
+        marker = "TMM420_YAML_CAUSE_SECRET_68a4"
+        self._write(tmp_path, "model: [unterminated\n")
+        with patch.object(
+            config_module,
+            "fast_safe_load",
+            side_effect=ValueError(f"parser saw {marker}"),
+        ):
+            with pytest.raises(InvalidUserConfigError) as exc_info:
+                self._validate(tmp_path)
+
+        assert marker not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    def test_strict_version_diagnostic_does_not_echo_persisted_value(self, tmp_path):
+        marker = "987654321"
+        self._write(tmp_path, f"_config_version: {marker}\n")
+
+        with pytest.raises(InvalidUserConfigError) as exc_info:
+            self._validate(tmp_path)
+
+        diagnostic = str(exc_info.value)
+        assert marker not in diagnostic
+        assert "_config_version" in diagnostic
+
+    def test_strict_version_parse_failure_does_not_warn_or_chain_raw_parser_value(
+        self, tmp_path, capsys
+    ):
+        from hermes_cli import config as config_module
+
+        marker = "TMM420_MIGRATE_PARSE_SECRET_91d2"
+        self._write(tmp_path, "model: [unterminated\n")
+        with patch.object(
+            config_module,
+            "fast_safe_load",
+            side_effect=ValueError(f"parser saw {marker}"),
+        ), patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(InvalidUserConfigError) as exc_info:
+                config_module.check_config_version(raise_on_parse_error=True)
+
+        captured = capsys.readouterr()
+        combined = f"{exc_info.value}\n{captured.out}\n{captured.err}"
+        assert marker not in combined
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
     def test_does_not_echo_invalid_container_values(self, tmp_path):
         marker = "do-not-print-this-api-key"

@@ -235,8 +235,8 @@ def test_capture_gateway_receipt_records_prior_identity_and_live_incarnation(tmp
 
     identity = verify.capture_gateway_receipt_identity(
         state_path=state,
+        live_gateway_pid=lambda _home: 7,
         process_start_time=lambda pid: 11 if pid == 7 else None,
-        process_identity_matches=_process_identity_matches,
     )
 
     assert identity.pid == 7
@@ -248,11 +248,18 @@ def test_capture_gateway_receipt_records_prior_identity_and_live_incarnation(tmp
 def test_capture_gateway_receipt_identity_rejects_malformed_existing_receipt(tmp_path):
     receipt = tmp_path / "gateway_state.json"
     receipt.write_text("{not-json", encoding="utf-8")
+    discovered = []
 
     with pytest.raises(
         verify.GatewayVerificationError, match="cannot capture pre-restart gateway receipt"
     ):
-        verify.capture_gateway_receipt_identity(state_path=receipt)
+        verify.capture_gateway_receipt_identity(
+            state_path=receipt,
+            live_gateway_pid=lambda home: discovered.append(home) or 7,
+            process_start_time=lambda pid: 17 if pid == 7 else None,
+        )
+
+    assert discovered == [tmp_path]
 
 
 def test_capture_gateway_receipt_identity_finds_live_gateway_without_receipt(tmp_path):
@@ -263,6 +270,43 @@ def test_capture_gateway_receipt_identity_finds_live_gateway_without_receipt(tmp
     )
 
     assert captured.live_incarnation == (7, 17)
+
+
+def test_stale_receipt_cannot_hide_same_live_gateway_across_restart(tmp_path):
+    state = tmp_path / "gateway_state.json"
+    _write_gateway_payload(
+        state,
+        pid=99,
+        start_time=1,
+        updated_at=_PRE_RESTART_UPDATED_AT,
+        writer_pid=99,
+        writer_start_time=1,
+    )
+    discovered = []
+
+    pre_restart = verify.capture_gateway_receipt_identity(
+        state_path=state,
+        live_gateway_pid=lambda home: discovered.append(home) or 7,
+        process_start_time=lambda pid: 11 if pid == 7 else None,
+    )
+
+    assert discovered == [tmp_path]
+    assert pre_restart.pid == 99
+    assert pre_restart.live_incarnation == (7, 11)
+
+    _write_gateway_payload(
+        state,
+        pid=7,
+        start_time=11,
+        writer_pid=7,
+        writer_start_time=11,
+    )
+    with pytest.raises(verify.GatewayVerificationError, match="pre-restart.*incarnation"):
+        _verify_gateway_once(
+            state,
+            pre_restart=pre_restart,
+            process_start_time=lambda pid: 11 if pid == 7 else None,
+        )
 
 
 @pytest.mark.parametrize(

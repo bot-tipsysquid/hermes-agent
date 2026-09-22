@@ -34,7 +34,9 @@ The updater performs these 14 gates in this exact order:
 
 1. Acquire a deterministic owner-only, per-checkout transaction lock. A live
    concurrent invocation fails before checkout validation or mutation; an
-   unlocked stale metadata file is safely reused.
+   unlocked stale metadata file is safely reused. The runtime root must be an
+   absolute, real, owner-only directory owned by the current user; the
+   dedicated lock directory and lock file reject symlinks.
 2. Validate the exact checkout, `ken/downstream` branch, cleanliness, and
    canonical fetch and push remote transports. These read-only Git checks run
    under the lock before any host or Toolbx preflight.
@@ -54,9 +56,10 @@ The updater performs these 14 gates in this exact order:
 8. Run locked Node installation, focused updater tests, Web and Desktop
    typechecks, and the Web UI build.
 9. Run the shared Toolbx-aware ARM64 Desktop package path.
-10. Recheck the branch and require a current Desktop content stamp plus bounded,
-    structurally plausible ARM64 ELF64 binaries for both the packaged
-    application and packaged `node-pty`.
+10. Recheck the expected live branch, require a clean checkout, and prove `HEAD`
+    still equals the intended post-merge SHA. Only then require a current Desktop
+    content stamp plus bounded, structurally plausible ARM64 ELF64 binaries for
+    both the packaged application and packaged `node-pty`.
 11. Push `ken/downstream` to `fork/ken/downstream` without force and read back
     the exact remote SHA.
 12. Run `hermes config migrate`, then the non-interactive strict
@@ -68,11 +71,12 @@ The updater performs these 14 gates in this exact order:
 13. Prove the OneCLI loopback service accepts a TCP connection and
     `onecli auth status` reports authenticated. No `/health` or `/healthz` route
     is assumed.
-14. Capture the pre-restart gateway receipt identity, including its PID/start
-    fingerprint and `updated_at` when present, then record the restart threshold
-    and restart the gateway. Require a newer parseable receipt created after
-    that threshold, a different live Hermes gateway PID/start incarnation when
-    one existed before restart, and a connected platform writer whose PID/start
+14. Independently discover and fingerprint the canonical live gateway process,
+    regardless of receipt quality, while separately capturing receipt PID/start
+    and `updated_at` fields when present. Then record the restart threshold and
+    restart the gateway. Require a newer parseable receipt created after that
+    threshold, a different live Hermes gateway PID/start incarnation when one
+    existed before restart, and a connected platform writer whose PID/start
     identity matches that new gateway incarnation.
 
 Any failed gate stops the sequence. Publishing pristine `fork/main` necessarily

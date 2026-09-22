@@ -29,6 +29,7 @@ _UPDATED_DOWNSTREAM = "2" * 40
 _UPSTREAM_SHA = "a" * 40
 _PRE_RESTART_GATEWAY = object()
 _RESTART_THRESHOLD = 1234.5
+_DEFAULT_JSON_PAYLOAD = object()
 
 
 def _result(returncode=0, stdout="", stderr=""):
@@ -50,11 +51,14 @@ class _GitRunner:
         local_main_diverged: bool = False,
         fork_main_diverged: bool = False,
         onecli_authenticated: bool = True,
+        onecli_payload: object = _DEFAULT_JSON_PAYLOAD,
         upstream_url: str = _UPSTREAM_URL,
         fork_url: str = _FORK_URL,
         fail_marker: str | None = None,
         interrupt_at: str | None = None,
         interrupt_type: type[BaseException] = KeyboardInterrupt,
+        runtime_identity_payload: object = _DEFAULT_JSON_PAYLOAD,
+        post_build_mutation: str | None = None,
     ) -> None:
         self.repo = repo.resolve()
         self.branch = branch
@@ -67,11 +71,14 @@ class _GitRunner:
         self.local_main_diverged = local_main_diverged
         self.fork_main_diverged = fork_main_diverged
         self.onecli_authenticated = onecli_authenticated
+        self.onecli_payload = onecli_payload
         self.upstream_url = upstream_url
         self.fork_url = fork_url
         self.fail_marker = fail_marker
         self.interrupt_at = interrupt_at
         self.interrupt_type = interrupt_type
+        self.runtime_identity_payload = runtime_identity_payload
+        self.post_build_mutation = post_build_mutation
         self.main_sha = "0" * 40
         self.downstream_sha = _INITIAL_DOWNSTREAM
         self.remote_main_sha = "0" * 40
@@ -164,21 +171,33 @@ class _GitRunner:
             raise AssertionError(f"unexpected git command: {argv}")
 
         if argv[:3] == ("python", "-m", "hermes_cli.main") and "desktop" in argv:
-            return _result(1, stderr="desktop build failed") if self.fail_desktop_build else _result()
+            if self.fail_desktop_build:
+                return _result(1, stderr="desktop build failed")
+            if self.post_build_mutation == "branch":
+                self.branch = "main"
+            elif self.post_build_mutation == "dirty":
+                self.dirty = True
+            elif self.post_build_mutation == "sha":
+                self.downstream_sha = "3" * 40
+            return _result()
         if argv[:3] == ("python", "-m", "hermes_cli.downstream_update"):
+            payload = self.runtime_identity_payload
+            if payload is _DEFAULT_JSON_PAYLOAD:
+                payload = {
+                    "checkout_root": str(self.repo),
+                    "sha": self.downstream_sha,
+                    "short_sha": self.downstream_sha[:8],
+                    "source": "git",
+                    "version": "0.test",
+                }
             return _result(
-                stdout=json.dumps(
-                    {
-                        "checkout_root": str(self.repo),
-                        "sha": self.downstream_sha,
-                        "short_sha": self.downstream_sha[:8],
-                        "source": "git",
-                        "version": "0.test",
-                    }
-                )
+                stdout=json.dumps(payload)
             )
         if argv[:2] == ("onecli", "auth"):
-            return _result(stdout=json.dumps({"authenticated": self.onecli_authenticated}))
+            payload = self.onecli_payload
+            if payload is _DEFAULT_JSON_PAYLOAD:
+                payload = {"authenticated": self.onecli_authenticated}
+            return _result(stdout=json.dumps(payload))
         return _result()
 
 
@@ -365,6 +384,197 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
     )
 
 
+def test_happy_path_orders_every_externally_significant_gate(tmp_path):
+    runner = _GitRunner(tmp_path)
+
+    result = _run(
+        runner,
+        verify_config=updater._verify_config,
+        verify_runtime_identity=updater._verify_runtime_identity,
+    )
+
+    assert result == _UPDATED_DOWNSTREAM
+    events = runner.events
+
+    def position(event, occurrence=0):
+        matches = [index for index, value in enumerate(events) if value == event]
+        return matches[occurrence]
+
+    branch_probe = ("git", "branch", "--show-current")
+    clean_probe = ("git", "status", "--porcelain", "--untracked-files=all")
+    head_probe = ("git", "rev-parse", "HEAD")
+    ordered = [
+        position("lock-acquired"),
+        position(("git", "rev-parse", "--show-toplevel")),
+        position("host-ready"),
+        position("toolbox-ready"),
+        position(
+            (
+                "git",
+                "fetch",
+                "upstream",
+                "+refs/heads/main:refs/remotes/upstream/main",
+            )
+        ),
+        position(
+            ("git", "push", "fork", f"{_UPSTREAM_SHA}:refs/heads/main")
+        ),
+        position(
+            (
+                "git",
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                "fork",
+                "refs/heads/main",
+            )
+        ),
+        position(("git", "checkout", "ken/downstream")),
+        position(("git", "merge", "--no-edit", "main")),
+        position(("uv", "sync", "--locked", "--extra", "all", "--extra", "dev")),
+        position(
+            (
+                "toolbox",
+                "run",
+                "--container",
+                "hermes-arm-build",
+                "npm",
+                "ci",
+                "--include=dev",
+            )
+        ),
+        next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, tuple) and event and event[0].endswith("run_tests.sh")
+        ),
+        position(
+            (
+                "toolbox",
+                "run",
+                "--container",
+                "hermes-arm-build",
+                "npm",
+                "run",
+                "typecheck",
+                "--workspace",
+                "web",
+            )
+        ),
+        position(
+            (
+                "toolbox",
+                "run",
+                "--container",
+                "hermes-arm-build",
+                "npm",
+                "run",
+                "typecheck",
+                "--workspace",
+                "apps/desktop",
+            )
+        ),
+        position(
+            (
+                "toolbox",
+                "run",
+                "--container",
+                "hermes-arm-build",
+                "npm",
+                "run",
+                "build",
+                "--workspace",
+                "web",
+            )
+        ),
+        position(
+            (
+                "python",
+                "-m",
+                "hermes_cli.main",
+                "desktop",
+                "--build-only",
+                "--force-build",
+            )
+        ),
+        position(branch_probe, -1),
+        position(clean_probe, -1),
+        position(head_probe, -1),
+        position("artifacts-verified"),
+        position(
+            (
+                "git",
+                "push",
+                "fork",
+                f"{_UPDATED_DOWNSTREAM}:refs/heads/ken/downstream",
+            )
+        ),
+        position(
+            (
+                "git",
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                "fork",
+                "refs/heads/ken/downstream",
+            )
+        ),
+        position(("python", "-m", "hermes_cli.main", "config", "migrate")),
+        position(("python", "-m", "hermes_cli.main", "config", "validate")),
+        position(
+            (
+                "python",
+                "-m",
+                "hermes_cli.downstream_update",
+                "--runtime-identity-json",
+            )
+        ),
+        position("onecli-service-ready"),
+        position(("onecli", "auth", "status")),
+        position("gateway-receipt-captured"),
+        position("gateway-restart-threshold"),
+        position(("python", "-m", "hermes_cli.main", "gateway", "restart")),
+        position("gateway-ready"),
+        position("lock-released"),
+    ]
+    assert ordered == sorted(ordered)
+    assert len(ordered) == len(set(ordered))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("branch", "expected branch"),
+        ("dirty", "working tree is not clean"),
+        ("sha", "HEAD moved"),
+    ],
+)
+def test_post_build_revision_recheck_precedes_artifacts_push_and_restart(
+    tmp_path, mutation, message
+):
+    runner = _GitRunner(tmp_path, post_build_mutation=mutation)
+
+    with pytest.raises(DownstreamUpdateError, match=message):
+        _run(runner)
+
+    assert "artifacts-verified" not in runner.events
+    assert not _pushed_branch(runner, "ken/downstream")
+    assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
+
+
+def test_artifact_verification_failure_prevents_downstream_push_and_restart(tmp_path):
+    runner = _GitRunner(tmp_path)
+
+    def reject_artifacts(_runner, _repo):
+        raise RuntimeError("artifact verification rejected")
+
+    with pytest.raises(DownstreamUpdateError, match="artifact verification"):
+        _run(runner, verify_artifacts=reject_artifacts)
+
+    assert not _pushed_branch(runner, "ken/downstream")
+    assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
+
+
 def test_fast_forward_failure_restores_downstream_and_stops_before_dependencies(tmp_path):
     runner = _GitRunner(tmp_path, fail_ff=True)
 
@@ -403,7 +613,7 @@ def test_desktop_build_failure_prevents_push_and_restart(tmp_path):
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
 
-@pytest.mark.parametrize("marker", ["--locked", "ci", "run_tests.sh", "typecheck"])
+@pytest.mark.parametrize("marker", ["--locked", "ci", "run_tests.sh", "typecheck", "build"])
 def test_dependency_and_test_gate_failures_prevent_push_and_restart(tmp_path, marker):
     runner = _GitRunner(tmp_path, fail_marker=marker)
 
@@ -776,6 +986,17 @@ def test_onecli_authentication_failure_prevents_gateway_restart(tmp_path):
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
 
+@pytest.mark.parametrize("payload", [[], "authenticated", True, None])
+def test_onecli_authentication_requires_json_object_before_restart(tmp_path, payload):
+    runner = _GitRunner(tmp_path, onecli_payload=payload)
+
+    with pytest.raises(DownstreamUpdateError, match="JSON object"):
+        _run(runner)
+
+    assert any(command[:3] == ("onecli", "auth", "status") for command in runner.commands)
+    assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
+
+
 def test_locked_all_and_dev_extras_are_selected_before_focused_tests(tmp_path):
     runner = _GitRunner(tmp_path)
 
@@ -923,6 +1144,79 @@ def test_strict_config_validation_failure_stops_before_gateway_restart(tmp_path)
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
 
+def _runtime_identity_payload(repo: Path, **overrides) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "checkout_root": str(repo.resolve()),
+        "source": "git",
+        "sha": _UPDATED_DOWNSTREAM,
+        "version": "0.test",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize("payload", [[], "identity", True, None])
+def test_runtime_identity_gate_requires_json_object(tmp_path, payload):
+    runner = _GitRunner(tmp_path, runtime_identity_payload=payload)
+
+    with pytest.raises(DownstreamUpdateError, match="JSON object"):
+        updater._verify_runtime_identity(runner, _config(tmp_path), _UPDATED_DOWNSTREAM)
+
+
+@pytest.mark.parametrize(
+    ("shape", "value"),
+    [
+        ("missing", None),
+        ("null", None),
+        ("empty", ""),
+        ("whitespace", "   "),
+        ("relative", "relative/checkout"),
+        ("non-string", 17),
+    ],
+)
+def test_runtime_identity_gate_requires_nonempty_absolute_checkout_root(
+    tmp_path, shape, value
+):
+    payload = _runtime_identity_payload(tmp_path, checkout_root=value)
+    if shape == "missing":
+        payload.pop("checkout_root")
+    runner = _GitRunner(tmp_path, runtime_identity_payload=payload)
+
+    with pytest.raises(
+        DownstreamUpdateError, match="checkout_root.*non-empty absolute string"
+    ):
+        updater._verify_runtime_identity(runner, _config(tmp_path), _UPDATED_DOWNSTREAM)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"checkout_root": "/wrong/checkout"}, "runtime checkout.*does not match"),
+        ({"source": "archive"}, "runtime identity source.*git"),
+        ({"sha": "f" * 40}, "runtime revision.*does not match"),
+        ({"version": None}, "runtime version identity is missing"),
+        ({"version": ""}, "runtime version identity is missing"),
+    ],
+)
+def test_runtime_identity_gate_rejects_wrong_provenance_or_missing_version(
+    tmp_path, overrides, message
+):
+    payload = _runtime_identity_payload(tmp_path, **overrides)
+    runner = _GitRunner(tmp_path, runtime_identity_payload=payload)
+
+    with pytest.raises(DownstreamUpdateError, match=message):
+        updater._verify_runtime_identity(runner, _config(tmp_path), _UPDATED_DOWNSTREAM)
+
+
+def test_runtime_identity_gate_rejects_missing_version(tmp_path):
+    payload = _runtime_identity_payload(tmp_path)
+    payload.pop("version")
+    runner = _GitRunner(tmp_path, runtime_identity_payload=payload)
+
+    with pytest.raises(DownstreamUpdateError, match="runtime version identity is missing"):
+        updater._verify_runtime_identity(runner, _config(tmp_path), _UPDATED_DOWNSTREAM)
+
+
 def test_runtime_identity_gate_rejects_other_revision(tmp_path):
     runner = _GitRunner(tmp_path)
     runner.downstream_sha = "f" * 40
@@ -964,5 +1258,6 @@ def test_dry_run_prints_plan_without_touching_checkout(capsys):
         index for index, line in enumerate(numbered_steps) if "native Fedora Silverblue" in line
     )
     assert checkout_validation < host_preflight
+    assert "recheck clean branch and intended SHA, then verify" in numbered_steps[9]
     assert "strictly validate config" in numbered_steps[11]
     assert "capture pre-restart" in numbered_steps[13]

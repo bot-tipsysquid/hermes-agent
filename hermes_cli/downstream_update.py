@@ -497,6 +497,10 @@ def _verify_onecli(
         payload = json.loads(_stdout(status))
     except (TypeError, ValueError) as exc:
         raise DownstreamUpdateError("OneCLI authentication check returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise DownstreamUpdateError(
+            "OneCLI authentication check must return a JSON object"
+        )
     if payload.get("authenticated") is not True:
         raise DownstreamUpdateError("OneCLI authentication check is not authenticated")
 
@@ -535,16 +539,33 @@ def _verify_runtime_identity(
         payload = json.loads(_stdout(result))
     except (TypeError, ValueError) as exc:
         raise DownstreamUpdateError("runtime revision identity returned invalid JSON") from exc
-    actual_root = Path(str(payload.get("checkout_root") or "")).resolve()
+    if not isinstance(payload, dict):
+        raise DownstreamUpdateError("runtime revision identity must be a JSON object")
+
+    checkout_value = payload.get("checkout_root")
+    if not isinstance(checkout_value, str) or not checkout_value.strip():
+        raise DownstreamUpdateError(
+            "runtime checkout_root must be a non-empty absolute string"
+        )
+    checkout_path = Path(checkout_value)
+    if not checkout_path.is_absolute():
+        raise DownstreamUpdateError(
+            "runtime checkout_root must be a non-empty absolute string"
+        )
+    try:
+        actual_root = checkout_path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DownstreamUpdateError("runtime checkout_root cannot be resolved") from exc
     if actual_root != config.expected_repo.resolve():
         raise DownstreamUpdateError(
             f"runtime checkout {actual_root} does not match {config.expected_repo.resolve()}"
         )
-    if payload.get("source") != "git" or payload.get("sha") != expected_sha:
-        raise DownstreamUpdateError(
-            f"runtime revision identity {payload.get('sha')!r} does not match {expected_sha}"
-        )
-    if not isinstance(payload.get("version"), str) or not payload["version"]:
+    if payload.get("source") != "git":
+        raise DownstreamUpdateError("runtime identity source must be git")
+    if payload.get("sha") != expected_sha:
+        raise DownstreamUpdateError("runtime revision identity does not match expected revision")
+    version = payload.get("version")
+    if not isinstance(version, str) or not version.strip():
         raise DownstreamUpdateError("runtime version identity is missing")
 
 
@@ -713,7 +734,6 @@ def _run_update_transaction(
         description="ARM64 Desktop build",
         capture_output=False,
     )
-    _gate("ARM64 artifact verification", lambda: verify_artifacts(command_runner, repo))
 
     _require_branch(command_runner, repo, config.live_branch)
     _require_clean(command_runner, repo)
@@ -724,6 +744,7 @@ def _run_update_transaction(
         raise DownstreamUpdateError(
             f"downstream HEAD moved during verification: {intended_sha} -> {local_sha}"
         )
+    _gate("ARM64 artifact verification", lambda: verify_artifacts(command_runner, repo))
 
     output(f"→ Pushing {config.live_branch} without force")
     _git(
@@ -843,7 +864,7 @@ def _dry_run_plan() -> tuple[str, ...]:
         "uv sync --locked --extra all --extra dev",
         "npm ci, focused tests, Web/Desktop typechecks, Web UI build",
         "ARM64 Desktop build through shared Toolbx-aware path",
-        "verify branch, Desktop build stamp, bounded ARM64 ELF app, and node-pty",
+        "recheck clean branch and intended SHA, then verify Desktop build stamp, bounded ARM64 ELF app, and node-pty",
         "push fork ken/downstream without force and verify SHA",
         "migrate then strictly validate config and verify final CLI runtime revision identity",
         "verify OneCLI loopback readiness plus authentication",
