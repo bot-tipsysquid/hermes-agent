@@ -1400,9 +1400,18 @@ def _is_fedora_silverblue_host() -> bool:
 
 def _fedora_silverblue_without_host_make() -> bool:
     """Return True when Silverblue lacks any native-addon build prerequisite."""
-    required = ("make", "gcc", "g++", "python3")
+    required = ("make", "gcc", "g++", "python3", "node", "npm", "pkg-config")
     return _is_fedora_silverblue_host() and any(
         not shutil.which(tool) for tool in required)
+
+
+def _desktop_build_npm(host_npm: str | None) -> str | None:
+    """Use Toolbx's npm when Silverblue intentionally has no host Node toolchain."""
+    if host_npm:
+        return host_npm
+    if _is_fedora_silverblue_host() and shutil.which("toolbox"):
+        return "npm"
+    return None
 
 
 def _desktop_auto_ozone_platform_hint() -> Optional[str]:
@@ -1419,76 +1428,69 @@ def _desktop_auto_ozone_platform_hint() -> Optional[str]:
 
 
 def _desktop_toolbox_build_container() -> str | None:
-    """Find a Toolbox with npm plus native build tools for Desktop."""
+    """Provision and verify the named release-matched Desktop build Toolbx."""
     if not _fedora_silverblue_without_host_make():
         return None
     toolbox = shutil.which("toolbox")
     if not toolbox:
-        return None
+        raise RuntimeError(
+            "Fedora Silverblue lacks host build tools and toolbox is unavailable"
+        )
+    from hermes_cli.desktop_toolbox import (
+        SubprocessRunner,
+        ToolboxProvisionError,
+        ensure_desktop_toolbox,
+    )
+    from hermes_cli.main import PROJECT_ROOT
+
     try:
-        listed = subprocess.run(
-            [toolbox, "list", "--containers"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if listed.returncode != 0:
-        return None
-    names: list[str] = []
-    for line in (listed.stdout or "").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("CONTAINER "):
-            continue
-        parts = stripped.split()
-        if len(parts) >= 2:
-            names.append(parts[1])
-    candidates = [
-        *(["hermes-arm-build"] if "hermes-arm-build" in names else []),
-        *(name for name in names if name != "hermes-arm-build"),
-    ]
-    seen: set[str] = set()
-    for name in candidates:
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        try:
-            probe = subprocess.run(
-                [
-                    toolbox, "run", "--container", name, "sh", "-lc",
-                    "command -v make >/dev/null && command -v gcc >/dev/null && "
-                    "command -v g++ >/dev/null && command -v python3 >/dev/null && "
-                    "command -v npm >/dev/null",
-                ],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                check=False, timeout=30)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if probe.returncode == 0:
-            return name
-    return None
+        return ensure_desktop_toolbox(
+            runner=SubprocessRunner(),
+            project_root=PROJECT_ROOT,
+            toolbox_executable=toolbox,
+        )
+    except ToolboxProvisionError as exc:
+        raise RuntimeError(f"Desktop build Toolbx is not ready: {exc}") from exc
+
+
+def _desktop_npm_command(npm: str, project_root: Path) -> list[str]:
+    """Resolve one npm command used by both dependency install and packaging."""
+    if container := _desktop_toolbox_build_container():
+        from hermes_cli.desktop_toolbox import toolbox_npm_command
+
+        toolbox = shutil.which("toolbox")
+        if not toolbox:
+            raise RuntimeError("verified Desktop Toolbx lost its toolbox executable")
+        print(
+            "  → Host lacks native build tools; running Desktop install and packaging "
+            f"inside toolbox '{container}'"
+        )
+        return toolbox_npm_command(toolbox, container)
+    return [npm]
 
 
 def _run_desktop_dependency_install(
     npm: str, cwd: Path, *, capture_output: bool = True,
     env: dict[str, str] | None = None,
+    npm_command: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Install Desktop dependencies on-host or in a capable Silverblue Toolbox."""
     from hermes_cli.main_web_build import (
         _run_npm_install_deterministic,
         _run_npm_install_deterministic_with_prefix,
     )
-    if container := _desktop_toolbox_build_container():
-        print(
-            "  → Host lacks native build tools; running Desktop npm install "
-            f"inside toolbox '{container}'")
-        toolbox = shutil.which("toolbox") or "toolbox"
+    command = npm_command or _desktop_npm_command(npm, cwd)
+    if command != [npm]:
         return _run_npm_install_deterministic_with_prefix(
-            [toolbox, "run", "--container", container, "npm"], cwd,
+            command, cwd,
             capture_output=capture_output, env=env)
     return _run_npm_install_deterministic(
         npm, cwd, capture_output=capture_output, env=env)
 
 
-def _install_desktop_workspace_deps(npm: str, env: dict) -> None:
+def _install_desktop_workspace_deps(
+    npm: str, env: dict, *, npm_command: list[str] | None = None,
+) -> None:
     """npm-install the desktop workspace; exits on a failure that isn't a repairable missing Electron dist."""
     from hermes_cli.main import PROJECT_ROOT
     from hermes_cli.update_cmd_deps import (
@@ -1507,7 +1509,8 @@ def _install_desktop_workspace_deps(npm: str, env: dict) -> None:
     # env keeps its PYTHON hint while restoring managed Node ahead of PATH.
     nixos_env = with_hermes_node_path(_nixos_build_env())
     install_result = _run_desktop_dependency_install(
-        npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
+        npm, PROJECT_ROOT, capture_output=False, env=nixos_env,
+        npm_command=npm_command)
     if install_result.returncode == 0:
         _record_npm_lockfile_hash(hermes_root, DESKTOP_NPM_SCOPE)
         return
@@ -1611,7 +1614,8 @@ def _build_desktop_app(desktop_dir: Path, *, source_mode: bool, npm: str, env: d
     """npm-install + build the desktop app, stage-and-swapping the packaged tree. Returns the new
     packaged exe (None in source mode). Exits on unrecoverable failure with the previous app kept."""
     from hermes_cli.main import PROJECT_ROOT
-    _install_desktop_workspace_deps(npm, env)
+    npm_command = _desktop_npm_command(npm, PROJECT_ROOT)
+    _install_desktop_workspace_deps(npm, env, npm_command=npm_command)
 
     build_label = "source build" if source_mode else "packaged app"
     print(f"→ Building desktop {build_label}...")
@@ -1626,7 +1630,7 @@ def _build_desktop_app(desktop_dir: Path, *, source_mode: bool, npm: str, env: d
     # only replaced — by rename — after the staged result verifies.
     # See #86443.
     staging_dir: Optional[Path] = None
-    build_cmd = [npm, "run", build_script]
+    build_cmd = [*npm_command, "run", build_script]
     if not source_mode:
         staging_dir = _desktop_staging_dir(desktop_dir)
         build_cmd += ["--", f"-c.directories.output={staging_dir}"]
@@ -1794,10 +1798,15 @@ def cmd_gui(args: argparse.Namespace):
     )
     npm = None
     if source_mode or needs_build:
-        npm = _resolve_node_runtime_npm()
+        host_npm = _resolve_node_runtime_npm()
+        if source_mode and not host_npm:
+            print("Desktop source mode requires host Node.js/npm for the Electron launch.")
+            print("Install Node.js, or use packaged mode so Fedora Silverblue can build in Toolbx.")
+            sys.exit(1)
+        npm = _desktop_build_npm(host_npm)
         if not npm:
             print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
-            print("Install Node.js, then run:  hermes gui")
+            print("Install Node.js, or provision Toolbx on Fedora Silverblue, then run:  hermes gui")
             sys.exit(1)
 
     if skip_build:
