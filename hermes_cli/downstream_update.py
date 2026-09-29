@@ -926,11 +926,11 @@ def _run_update_transaction(
         _git(command_runner, repo, "rev-parse", "HEAD", description="pin downstream revision")
     )
 
-    output("→ Synchronizing locked Python dependencies with runtime and dev extras")
+    output("→ Synchronizing locked Python dependencies with runtime extras and dev group")
     assert_checkout()
     _run(
         command_runner,
-        [config.uv_executable, "sync", "--locked", "--extra", "all", "--extra", "dev"],
+        [config.uv_executable, "sync", "--locked", "--extra", "all", "--group", "dev"],
         repo=repo,
         description="locked Python dependency synchronization",
         capture_output=False,
@@ -1154,7 +1154,7 @@ def run_update(
 
 
 def _runtime_identity_payload() -> dict[str, object]:
-    from hermes_cli.build_info import get_code_identity
+    from hermes_cli.version_info import get_code_identity
 
     payload: dict[str, object] = dict(get_code_identity(refresh=True))
     payload["checkout_root"] = str(checkout_root().resolve())

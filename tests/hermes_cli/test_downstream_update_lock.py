@@ -15,7 +15,7 @@ from hermes_cli.downstream_update_lock import (
     transaction_lock_path,
 )
 
-pytestmark = pytest.mark.linux_only
+pytestmark = pytest.mark.platforms("linux")
 
 
 def _runtime_dir(tmp_path: Path, *, mode: int = 0o700) -> Path:

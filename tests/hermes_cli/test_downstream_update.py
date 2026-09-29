@@ -533,7 +533,7 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
     checkout_downstream = _index(runner.commands, ("git", "checkout", "ken/downstream"))
     python_sync = _index(
         runner.commands,
-        ("uv", "sync", "--locked", "--extra", "all", "--extra", "dev"),
+        ("uv", "sync", "--locked", "--extra", "all", "--group", "dev"),
     )
     test_run = next(
         i for i, command in enumerate(runner.commands) if command[0].endswith("run_tests.sh")
@@ -644,7 +644,7 @@ def test_happy_path_orders_every_externally_significant_gate(tmp_path):
         ),
         position(("git", "checkout", "ken/downstream")),
         position(("git", "merge", "--no-edit", "main")),
-        position(("uv", "sync", "--locked", "--extra", "all", "--extra", "dev")),
+        position(("uv", "sync", "--locked", "--extra", "all", "--group", "dev")),
         position(
             (
                 "toolbox",
@@ -1306,14 +1306,14 @@ def test_onecli_authentication_requires_json_object_before_restart(tmp_path, pay
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
 
-def test_locked_all_and_dev_extras_are_selected_before_focused_tests(tmp_path):
+def test_locked_all_extra_and_dev_group_are_selected_before_focused_tests(tmp_path):
     runner = _GitRunner(tmp_path)
 
     _run(runner)
 
     sync = _index(
         runner.commands,
-        ("uv", "sync", "--locked", "--extra", "all", "--extra", "dev"),
+        ("uv", "sync", "--locked", "--extra", "all", "--group", "dev"),
     )
     focused = next(
         i for i, command in enumerate(runner.commands) if command[0].endswith("run_tests.sh")
@@ -1322,10 +1322,10 @@ def test_locked_all_and_dev_extras_are_selected_before_focused_tests(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required")
-def test_locked_all_and_dev_extras_resolve_in_disposable_environment(tmp_path):
+def test_locked_all_extra_and_dev_group_resolve_in_disposable_environment(tmp_path):
     disposable = tmp_path / "venv"
     result = subprocess.run(
-        ["uv", "sync", "--locked", "--extra", "all", "--extra", "dev", "--dry-run"],
+        ["uv", "sync", "--locked", "--extra", "all", "--group", "dev", "--dry-run"],
         cwd=updater.checkout_root(),
         env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(disposable)},
         capture_output=True,
@@ -1337,7 +1337,7 @@ def test_locked_all_and_dev_extras_resolve_in_disposable_environment(tmp_path):
 
     combined = f"{result.stdout}\n{result.stderr}".lower()
     assert result.returncode == 0, combined
-    assert "debugpy==" in combined  # dev extra
+    assert "debugpy==" in combined  # dev dependency group
     assert "uvloop==" in combined  # runtime all extra on Linux
     assert str(disposable) in combined
 
