@@ -5,20 +5,31 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from typing import cast
+from typing import cast, Sequence
 
 
-def source_product_current(project_root: Path, product: str, out: Path) -> bool:
-    """Read the compiler's receipt without acquiring tools or dependencies."""
-    from pm import env_for, installed_package
+def source_product_current(
+    project_root: Path,
+    product: str,
+    out: Path,
+    *,
+    node_command: Sequence[str] | None = None,
+) -> bool:
+    """Read the compiler's receipt with PM's Node or an explicit trusted command."""
+    if node_command is None:
+        from pm import env_for, installed_package
 
-    installed = installed_package("node")
-    if installed is None or installed.binary is None:
-        return False  # Only PM's Node may run the receipt reader; never the user's PATH copy.
-    node, env = str(installed.binary), env_for("node")
+        installed = installed_package("node")
+        if installed is None or installed.binary is None:
+            return False  # Only PM's Node may run the reader; never the user's PATH copy.
+        command, env = [str(installed.binary)], env_for("node")
+    else:
+        command, env = [str(part) for part in node_command], None
+        if not command:
+            return False
     try:
         result = subprocess.run(
-            [node, str(project_root / "scripts/build/freshness.mjs"),
+            [*command, str(project_root / "scripts/build/freshness.mjs"),
              "--source", str(project_root), "--product", product, "--out", str(out)],
             cwd=project_root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
         )

@@ -92,6 +92,45 @@ def test_arm64_app_current_stamp_and_packaged_node_pty_pass(arm64_bundle):
     assert receipt.node_pty == node_pty
 
 
+def test_arm64_artifact_freshness_uses_supplied_toolbox_node(
+    arm64_bundle, monkeypatch
+):
+    root, executable, node_pty = arm64_bundle
+    toolbox_node = [
+        "toolbox",
+        "run",
+        "--container",
+        "hermes-arm-build",
+        "node",
+    ]
+    captured = {}
+
+    def build_needed(desktop, project_root, *, source_mode, node_command):
+        captured.update(
+            desktop=desktop,
+            project_root=project_root,
+            source_mode=source_mode,
+            node_command=node_command,
+        )
+        return False
+
+    monkeypatch.setattr(verify, "_desktop_build_needed", build_needed)
+
+    receipt = verify.verify_arm64_update_artifacts(
+        root,
+        node_command=toolbox_node,
+    )
+
+    assert captured == {
+        "desktop": root / "apps" / "desktop",
+        "project_root": root,
+        "source_mode": False,
+        "node_command": toolbox_node,
+    }
+    assert receipt.executable == executable
+    assert receipt.node_pty == node_pty
+
+
 @pytest.mark.parametrize(("target", "message"), [("app", "application"), ("pty", "node-pty")])
 def test_wrong_architecture_fails_closed(arm64_bundle, target, message):
     root, executable, node_pty = arm64_bundle

@@ -71,7 +71,7 @@ class CheckoutIdentity:
 
 
 ProvisionToolbox = Callable[..., str]
-ArtifactVerifier = Callable[[CommandRunner, Path], None]
+ArtifactVerifier = Callable[[CommandRunner, Path, Sequence[str]], None]
 GatewayVerifier = Callable[[CommandRunner, str, object, float], None]
 GatewayReceiptCapturer = Callable[[CommandRunner], object]
 RestartClock = Callable[[], float]
@@ -646,10 +646,14 @@ def _sync_source(
     _require_clean(runner, repo)
 
 
-def _default_artifact_verifier(_runner: CommandRunner, repo: Path) -> None:
+def _default_artifact_verifier(
+    _runner: CommandRunner,
+    repo: Path,
+    node_command: Sequence[str],
+) -> None:
     from hermes_cli.downstream_update_verify import verify_arm64_update_artifacts
 
-    verify_arm64_update_artifacts(repo)
+    verify_arm64_update_artifacts(repo, node_command=node_command)
 
 
 def _default_gateway_receipt_capturer(_runner: CommandRunner) -> object:
@@ -1037,7 +1041,14 @@ def _run_update_transaction(
             f"downstream HEAD moved during verification: {intended_sha} -> {local_sha}"
         )
     assert_checkout()
-    _gate("ARM64 artifact verification", lambda: verify_artifacts(command_runner, repo))
+    _gate(
+        "ARM64 artifact verification",
+        lambda: verify_artifacts(
+            command_runner,
+            repo,
+            [*npm[:-1], "node"],
+        ),
+    )
 
     output(f"→ Pushing {config.live_branch} without force")
     assert_checkout()

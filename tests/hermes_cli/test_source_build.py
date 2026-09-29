@@ -44,6 +44,66 @@ def stamp_product(root, product, out):
                     str(root), product, str(out)], check=True)
 
 
+def test_source_product_current_accepts_explicit_trusted_node_command(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import source_build
+
+    trusted_node = [
+        "/usr/bin/toolbox",
+        "run",
+        "--container",
+        "hermes-arm-build",
+        "node",
+    ]
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="true\n")
+
+    monkeypatch.setattr(source_build.subprocess, "run", run)
+    monkeypatch.setattr(
+        pm,
+        "installed_package",
+        lambda _name: pytest.fail("explicit trusted Node must bypass PM Node selection"),
+    )
+
+    assert source_build.source_product_current(
+        tmp_path,
+        "desktop",
+        tmp_path / "dist",
+        node_command=trusted_node,
+    )
+    assert calls[0][0] == [
+        *trusted_node,
+        str(tmp_path / "scripts/build/freshness.mjs"),
+        "--source",
+        str(tmp_path),
+        "--product",
+        "desktop",
+        "--out",
+        str(tmp_path / "dist"),
+    ]
+
+
+def test_source_product_current_never_falls_back_to_path_node(tmp_path, monkeypatch):
+    from hermes_cli import source_build
+
+    monkeypatch.setattr(pm, "installed_package", lambda _name: None)
+    monkeypatch.setattr(
+        source_build.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("an arbitrary PATH Node must not run"),
+    )
+
+    assert not source_build.source_product_current(
+        tmp_path,
+        "desktop",
+        tmp_path / "dist",
+    )
+
+
 def test_source_build_uses_selected_python_for_isolated_icon_child(tmp_path, monkeypatch):
     from hermes_cli.source_build import source_build_env
     from pm import paths

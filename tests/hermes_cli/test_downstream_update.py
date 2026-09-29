@@ -278,7 +278,11 @@ def _provisioner(runner: _GitRunner, **_kwargs) -> str:
     return "hermes-arm-build"
 
 
-def _artifact_verifier(runner: _GitRunner, _repo: Path) -> None:
+def _artifact_verifier(
+    runner: _GitRunner,
+    _repo: Path,
+    _node_command,
+) -> None:
     runner.events.append("artifacts-verified")
 
 
@@ -621,6 +625,38 @@ def test_python_sync_uses_repo_pin_instead_of_the_launching_venv(tmp_path):
     ) in runner.commands
 
 
+def test_artifact_verification_uses_preflighted_toolbox_node_command(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import downstream_update_verify
+
+    runner = _GitRunner(tmp_path)
+    captured = {}
+
+    def verify(project_root, *, node_command):
+        captured["project_root"] = project_root
+        captured["node_command"] = node_command
+
+    monkeypatch.setattr(
+        downstream_update_verify,
+        "verify_arm64_update_artifacts",
+        verify,
+    )
+
+    _run(runner, verify_artifacts=updater._default_artifact_verifier)
+
+    assert captured == {
+        "project_root": tmp_path,
+        "node_command": [
+            "toolbox",
+            "run",
+            "--container",
+            "hermes-arm-build",
+            "node",
+        ],
+    }
+
+
 def test_transaction_pins_validated_checkout_for_late_source_imports(
     tmp_path, monkeypatch
 ):
@@ -643,7 +679,7 @@ def test_transaction_pins_validated_checkout_for_late_source_imports(
     monkeypatch.delitem(sys.modules, "pm", raising=False)
     assert str(repo) not in sys.path
 
-    def verify_late_source_import(_runner, callback_repo):
+    def verify_late_source_import(_runner, callback_repo, _node_command):
         imported = importlib.import_module("pm")
 
         assert callback_repo == repo
@@ -862,7 +898,7 @@ def test_post_build_revision_recheck_precedes_artifacts_push_and_restart(
 def test_artifact_verification_failure_prevents_downstream_push_and_restart(tmp_path):
     runner = _GitRunner(tmp_path)
 
-    def reject_artifacts(_runner, _repo):
+    def reject_artifacts(_runner, _repo, _node_command):
         raise RuntimeError("artifact verification rejected")
 
     with pytest.raises(DownstreamUpdateError, match="artifact verification"):

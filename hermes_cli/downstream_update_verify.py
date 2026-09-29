@@ -11,7 +11,7 @@ from pathlib import Path
 import stat
 import struct
 import time
-from typing import Callable, cast
+from typing import Callable, cast, Sequence
 
 from hermes_cli.main_desktop import (
     _desktop_build_needed,
@@ -277,6 +277,7 @@ def _node_pty_candidates(executable: Path) -> tuple[Path, ...]:
 def verify_arm64_update_artifacts(
     project_root: Path,
     *,
+    node_command: Sequence[str] | None = None,
     open_file: OpenFile = os.open,
 ) -> ArtifactReceipt:
     """Require a current Desktop stamp plus ARM64 app and packaged node-pty."""
@@ -286,7 +287,17 @@ def verify_arm64_update_artifacts(
     executable = _desktop_packaged_executable(desktop)
     if executable is None:
         raise ArtifactVerificationError("packaged ARM64 Desktop application is missing")
-    if _desktop_build_needed(desktop, root, source_mode=False):
+    stale = (
+        _desktop_build_needed(desktop, root, source_mode=False)
+        if node_command is None
+        else _desktop_build_needed(
+            desktop,
+            root,
+            source_mode=False,
+            node_command=list(node_command),
+        )
+    )
+    if stale:
         raise ArtifactVerificationError("Desktop build stamp is stale, missing, or incomplete")
     _require_aarch64(
         executable,

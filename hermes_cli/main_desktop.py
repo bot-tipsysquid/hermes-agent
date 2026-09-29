@@ -101,7 +101,13 @@ def _packaged_node_pty_missing(dist_dir: Path) -> bool:
     return not any(next(d.rglob("*.node"), None) for d in native_dirs if d.is_dir())
 
 
-def _desktop_build_needed(desktop_dir: Path, project_root: Path, *, source_mode: bool) -> bool:
+def _desktop_build_needed(
+    desktop_dir: Path,
+    project_root: Path,
+    *,
+    source_mode: bool,
+    node_command: list[str] | None = None,
+) -> bool:
     """True when the desktop build output is stale, missing, torn, or built in the other mode."""
     if source_mode:
         if not _desktop_dist_exists(desktop_dir):
@@ -122,7 +128,16 @@ def _desktop_build_needed(desktop_dir: Path, project_root: Path, *, source_mode:
 
     from hermes_cli.source_build import source_product_current
 
-    return dist_dir is None or not source_product_current(project_root, "desktop", dist_dir)
+    if dist_dir is None:
+        return True
+    if node_command is None:
+        return not source_product_current(project_root, "desktop", dist_dir)
+    return not source_product_current(
+        project_root,
+        "desktop",
+        dist_dir,
+        node_command=node_command,
+    )
 
 
 def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
@@ -1423,6 +1438,25 @@ def _desktop_npm_command(
     toolbox_container: str | None = None,
 ) -> list[str]:
     """Resolve one npm command used by both dependency preparation and packaging."""
+    node_command = _desktop_toolbox_node_command(
+        project_root,
+        toolbox_container=toolbox_container,
+    )
+    if node_command is not None:
+        print(
+            "  → Host lacks native build tools; running Desktop dependency preparation "
+            f"and packaging inside toolbox '{node_command[-2]}'"
+        )
+        return [*node_command[:-1], "npm"]
+    return [npm]
+
+
+def _desktop_toolbox_node_command(
+    project_root: Path,
+    *,
+    toolbox_container: str | None = None,
+) -> list[str] | None:
+    """Return Node in the verified Toolbx selected for this Desktop build, if any."""
     container = (
         _desktop_toolbox_build_container(
             toolbox_container,
@@ -1437,12 +1471,8 @@ def _desktop_npm_command(
         toolbox = shutil.which("toolbox")
         if not toolbox:
             raise RuntimeError("verified Desktop Toolbx lost its toolbox executable")
-        print(
-            "  → Host lacks native build tools; running Desktop dependency preparation "
-            f"and packaging inside toolbox '{container}'"
-        )
-        return toolbox_npm_command(toolbox, container)
-    return [npm]
+        return [*toolbox_npm_command(toolbox, container)[:-1], "node"]
+    return None
 
 
 def _promote_staged_desktop_app(
@@ -1766,28 +1796,36 @@ def cmd_gui(args: argparse.Namespace):
 
     packaged_executable = _desktop_packaged_executable(desktop_dir)
 
-    needs_build = not skip_build and (
-        force_build or _desktop_build_needed(desktop_dir, PROJECT_ROOT, source_mode=source_mode)
-    )
+    needs_build = False
     build_env = env
     npm: str | None = None
     npm_command: list[str] | None = None
     node_command: list[str] | None = None
     try:
+        if not skip_build:
+            if toolbox_container is not None or not source_mode:
+                node_command = _desktop_toolbox_node_command(
+                    PROJECT_ROOT,
+                    toolbox_container=toolbox_container,
+                )
+            needs_build = force_build or _desktop_build_needed(
+                desktop_dir,
+                PROJECT_ROOT,
+                source_mode=source_mode,
+                node_command=node_command,
+            )
         if needs_build:
             build_env = source_build_env(env, explicit=force_build or getattr(args, "build_only", False))
             npm = shutil.which("npm", path=build_env["PATH"])
             if npm is None:
                 raise RuntimeError("prepared source build environment has no npm executable")
             env["PATH"] = build_env["PATH"]
-            if toolbox_container is not None or not source_mode:
-                npm_command = _desktop_npm_command(
-                    npm,
-                    PROJECT_ROOT,
-                    toolbox_container=toolbox_container,
+            if node_command is not None:
+                npm_command = [*node_command[:-1], "npm"]
+                print(
+                    "  → Host lacks native build tools; running Desktop dependency preparation "
+                    f"and packaging inside toolbox '{node_command[-2]}'"
                 )
-                if len(npm_command) > 1:
-                    node_command = [*npm_command[:-1], "node"]
         if skip_build:
             _check_desktop_skip_build(
                 desktop_dir, PROJECT_ROOT, source_mode=source_mode, packaged_executable=packaged_executable

@@ -1,11 +1,12 @@
 """Downstream regression coverage for immutable-Fedora Desktop builds."""
 
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import desktop_toolbox, main_desktop, source_build
+from hermes_cli import desktop_toolbox, main, main_desktop, source_build
 
 
 def test_silverblue_without_host_make_is_detected(monkeypatch):
@@ -158,6 +159,77 @@ def test_forced_toolbox_fails_closed_when_container_is_unavailable(monkeypatch, 
             tmp_path,
             toolbox_container=desktop_toolbox.TOOLBOX_NAME,
         )
+
+
+def test_current_toolbox_desktop_receipt_does_not_trigger_another_build(
+    monkeypatch, tmp_path
+):
+    desktop_dir = tmp_path / "apps" / "desktop"
+    (desktop_dir / "package.json").parent.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
+    executable = desktop_dir / "release" / "linux-arm64-unpacked" / "Hermes"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("packaged app", encoding="utf-8")
+    dist = executable.parent / "resources" / "app.asar.unpacked" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("packaged renderer", encoding="utf-8")
+    selected = {}
+
+    def select_toolbox(toolbox_container=None, *, project_root=None):
+        selected["container"] = toolbox_container
+        selected["project_root"] = project_root
+        return desktop_toolbox.TOOLBOX_NAME
+
+    freshness = {}
+
+    def current(project_root, product, out, *, node_command=None):
+        freshness.update(
+            project_root=project_root,
+            product=product,
+            out=out,
+            node_command=node_command,
+        )
+        return True
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main_desktop, "_desktop_launch_env", lambda _args: ({}, []))
+    monkeypatch.setattr(main_desktop, "_register_linux_desktop_entry", lambda **_kwargs: None)
+    monkeypatch.setattr(main_desktop, "_desktop_toolbox_build_container", select_toolbox)
+    monkeypatch.setattr(
+        main_desktop.shutil,
+        "which",
+        lambda name, **_kwargs: "/usr/bin/toolbox" if name == "toolbox" else f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(source_build, "source_product_current", current)
+    monkeypatch.setattr(
+        source_build,
+        "source_build_env",
+        lambda *_args, **_kwargs: pytest.fail("a current Toolbx receipt must not rebuild"),
+    )
+
+    main_desktop.cmd_gui(
+        Namespace(
+            build_only=True,
+            toolbox_container=desktop_toolbox.TOOLBOX_NAME,
+        )
+    )
+
+    assert selected == {
+        "container": desktop_toolbox.TOOLBOX_NAME,
+        "project_root": tmp_path,
+    }
+    assert freshness == {
+        "project_root": tmp_path,
+        "product": "desktop",
+        "out": dist,
+        "node_command": [
+            "/usr/bin/toolbox",
+            "run",
+            "--container",
+            desktop_toolbox.TOOLBOX_NAME,
+            "node",
+        ],
+    }
 
 
 def test_packaging_reuses_the_toolbox_npm_command_used_for_dependency_install(
