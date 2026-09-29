@@ -337,6 +337,10 @@ def _run(runner: _GitRunner, **overrides):
         runner.events.append("gateway-restart-threshold")
         return _RESTART_THRESHOLD
 
+    def source_completion_clearer(repo):
+        assert repo == runner.repo
+        runner.events.append("source-completion-cleared")
+
     kwargs = {
         "runner": runner,
         "provision_toolbox": _provisioner,
@@ -349,6 +353,7 @@ def _run(runner: _GitRunner, **overrides):
         "onecli_service_ready": onecli_service_ready,
         "capture_gateway_receipt": capture_gateway_receipt,
         "restart_clock": restart_clock,
+        "source_completion_clearer": source_completion_clearer,
         "output": lambda _line: None,
     }
     kwargs.update(overrides)
@@ -605,6 +610,40 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
     assert runner.events.index("gateway-restart-threshold") < runner.events.index(
         ("python", "-m", "hermes_cli.main", "gateway", "restart")
     )
+
+
+def test_source_completion_is_cleared_after_install_gates_before_gateway_restart(
+    tmp_path,
+):
+    runner = _GitRunner(tmp_path)
+
+    _run(runner)
+
+    events = runner.events
+    cleared = events.index("source-completion-cleared")
+    assert events.count("source-completion-cleared") == 1
+    assert events.index("artifacts-verified") < cleared
+    assert events.index("config-ready") < cleared
+    assert events.index("runtime-identity-ready") < cleared
+    assert events.index("onecli-service-ready") < cleared
+    assert events[cleared - 1] == ("onecli", "auth", "status")
+    assert events[cleared + 1] == "gateway-receipt-captured"
+    assert cleared < events.index(
+        ("python", "-m", "hermes_cli.main", "gateway", "restart")
+    )
+
+
+def test_default_source_completion_clearer_delegates_to_venv_sync(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import venv_sync
+
+    cleared = []
+    monkeypatch.setattr(venv_sync, "clear_completion", cleared.append)
+
+    updater._default_source_completion_clearer(tmp_path)
+
+    assert cleared == [tmp_path]
 
 
 def test_python_sync_uses_repo_pin_instead_of_the_launching_venv(tmp_path):
@@ -1389,6 +1428,7 @@ def test_config_and_runtime_identity_failures_prevent_gateway_restart(tmp_path, 
     with pytest.raises(DownstreamUpdateError, match=gate):
         _run(runner, **override)
 
+    assert "source-completion-cleared" not in runner.events
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
 
@@ -1398,6 +1438,7 @@ def test_onecli_requires_local_service_readiness_before_authenticated_status(tmp
     with pytest.raises(DownstreamUpdateError, match="local service.*not ready"):
         _run(runner, onecli_service_ready=lambda _config: False)
 
+    assert "source-completion-cleared" not in runner.events
     assert not any(command[:2] == ("onecli", "auth") for command in runner.commands)
     assert not any("health" in part for command in runner.commands for part in command)
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
@@ -1409,6 +1450,7 @@ def test_onecli_authentication_failure_prevents_gateway_restart(tmp_path):
     with pytest.raises(DownstreamUpdateError, match="OneCLI authentication"):
         _run(runner)
 
+    assert "source-completion-cleared" not in runner.events
     assert any(command[:3] == ("onecli", "auth", "status") for command in runner.commands)
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 

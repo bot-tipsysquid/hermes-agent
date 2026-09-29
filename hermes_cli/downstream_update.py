@@ -83,6 +83,7 @@ ConfigVerifier = Callable[[CommandRunner, UpdateConfig], None]
 RuntimeIdentityVerifier = Callable[[CommandRunner, UpdateConfig, str], None]
 OneCLIServiceReady = Callable[[UpdateConfig], bool]
 ExecutableResolver = Callable[[str], str | None]
+SourceCompletionClearer = Callable[[Path], None]
 
 
 _GIT_REDIRECT_ENVIRONMENT = {
@@ -689,6 +690,12 @@ def _onecli_local_service_ready(_config: UpdateConfig) -> bool:
         return False
 
 
+def _default_source_completion_clearer(repo: Path) -> None:
+    from hermes_cli.venv_sync import clear_completion
+
+    clear_completion(repo)
+
+
 def _verify_onecli(
     runner: CommandRunner,
     config: UpdateConfig,
@@ -921,6 +928,7 @@ def _run_update_transaction(
     verify_config: ConfigVerifier,
     verify_runtime_identity: RuntimeIdentityVerifier,
     onecli_service_ready: OneCLIServiceReady,
+    source_completion_clearer: SourceCompletionClearer,
     output: Callable[[str], None],
 ) -> str:
     """Run one validated, locked, and host-preflighted downstream transaction."""
@@ -1084,6 +1092,10 @@ def _run_update_transaction(
     assert_checkout()
     _verify_onecli(command_runner, config, onecli_service_ready)
     assert_checkout()
+    _gate(
+        "source-completion discharge",
+        lambda: source_completion_clearer(repo),
+    )
     pre_restart = _gate(
         "pre-restart gateway receipt capture",
         lambda: capture_gateway_receipt(command_runner),
@@ -1131,6 +1143,7 @@ def run_update(
     verify_config: ConfigVerifier = _verify_config,
     verify_runtime_identity: RuntimeIdentityVerifier = _verify_runtime_identity,
     onecli_service_ready: OneCLIServiceReady = _onecli_local_service_ready,
+    source_completion_clearer: SourceCompletionClearer = _default_source_completion_clearer,
     resolve_git_executable: ExecutableResolver = shutil.which,
     output: Callable[[str], None] = print,
 ) -> str:
@@ -1189,6 +1202,7 @@ def run_update(
             verify_config=verify_config,
             verify_runtime_identity=verify_runtime_identity,
             onecli_service_ready=onecli_service_ready,
+            source_completion_clearer=source_completion_clearer,
             output=output,
         )
 
