@@ -14,6 +14,9 @@ def desktop_source(source_products, monkeypatch):
     monkeypatch.setattr(main, "PROJECT_ROOT", root)
     monkeypatch.setattr(main_desktop, "_desktop_launch_env", lambda args: ({}, []))
     monkeypatch.setattr(main_desktop, "_register_linux_desktop_entry", lambda **kwargs: None)
+    # This synthetic checkout exercises the host npm flow regardless of the
+    # developer machine's immutable-Fedora/Toolbx state.
+    monkeypatch.setattr(main_desktop, "_desktop_toolbox_build_container", lambda *args, **kwargs: None)
     return root, acquired
 
 

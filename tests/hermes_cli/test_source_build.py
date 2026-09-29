@@ -1,7 +1,7 @@
 """Source orchestration uses real node-deps/npm in an isolated checkout.
 
-Only PM's tool acquisition (and its installed-node record) is substituted with the host's node/npm. Small
-workspace scripts stand in for the expensive UI compilers; subprocess failures,
+Only PM's tool acquisition and Node resolution are substituted with the host's node/npm.
+Small workspace scripts stand in for the expensive UI compilers; subprocess failures,
 locked dependency selection, environment propagation and publication are real.
 """
 from __future__ import annotations
@@ -20,11 +20,25 @@ import pm
 from pm.package import Runner
 
 
+def _host_node_tools():
+    """Return one non-PM Node/npm pair and the environment that resolves it."""
+    host_path = os.pathsep.join(
+        entry for entry in os.get_exec_path() if ".hermes" not in Path(entry).parts
+    )
+    node, npm = shutil.which("node", path=host_path), shutil.which("npm", path=host_path)
+    assert node and npm, "source-build integration requires host node and npm"
+    return Path(node), Path(npm), {**os.environ, "PATH": host_path}
+
+
 def use_host_node_as_pm_node(monkeypatch):
     """Freshness reads run only under PM's recorded Node; stand the host's node in for it."""
-    node, real = Path(shutil.which("node")), pm.installed_package
+    node, _, node_env = _host_node_tools()
+    real_installed, real_env_for = pm.installed_package, pm.env_for
     monkeypatch.setattr(pm, "installed_package", lambda name, **kwargs: (
-        SimpleNamespace(binary=node) if name == "node" else real(name, **kwargs)))
+        SimpleNamespace(binary=node) if name == "node" else real_installed(name, **kwargs)))
+    monkeypatch.setattr(pm, "env_for", lambda *names, base_env=None: (
+        {**node_env, **(base_env or {}), "PATH": node_env["PATH"]}
+        if names == ("node",) else real_env_for(*names, base_env=base_env)))
 
 
 def copy_freshness_scripts(root):
@@ -36,12 +50,13 @@ def copy_freshness_scripts(root):
 
 
 def stamp_product(root, product, out):
+    node, _, node_env = _host_node_tools()
     script = (root / "scripts/build/freshness.mjs").as_uri()
-    subprocess.run([shutil.which("node"), "--input-type=module", "-e",
+    subprocess.run([node, "--input-type=module", "-e",
                     f"import {{recordProduct, buildInputs}} from {json.dumps(script)};"
                     "const [source, product, out] = process.argv.slice(1);"
                     "recordProduct({source, product, out, inputs: buildInputs(source, product)});",
-                    str(root), product, str(out)], check=True)
+                    str(root), product, str(out)], env=node_env, check=True)
 
 
 def test_source_product_current_accepts_explicit_trusted_node_command(
@@ -154,8 +169,7 @@ def test_installed_npm_does_not_authorize_missing_workspace_dependencies(source_
 
 @pytest.fixture
 def source_checkout(tmp_path, monkeypatch):
-    node, npm = shutil.which("node"), shutil.which("npm")
-    assert node and npm, "source-build integration requires node and npm"
+    node, npm, node_env = _host_node_tools()
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -201,7 +215,8 @@ def source_checkout(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     subprocess.run([npm, "install", "--package-lock-only", "--ignore-scripts", "--offline",
-                    "--no-audit", "--no-fund"], cwd=root, check=True)
+                    "--no-audit", "--no-fund"], cwd=root,
+                   env={**os.environ, "PATH": node_env["PATH"]}, check=True)
     scripts = root / "scripts" / "build"
     scripts.mkdir(parents=True)
     repository = Path(__file__).resolve().parents[2]
