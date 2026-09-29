@@ -612,14 +612,35 @@ def _sync_source(
     assert_safe_checkout()
     _require_branch(runner, repo, branch)
     assert_safe_checkout()
-    _git(
-        runner,
-        repo,
-        "merge",
-        "--no-edit",
-        "main",
-        description=f"merge main into {branch}",
-    )
+    try:
+        _git(
+            runner,
+            repo,
+            "merge",
+            "--no-edit",
+            "main",
+            description=f"merge main into {branch}",
+        )
+    except BaseException as merge_error:
+        try:
+            assert_checkout()
+            _git(
+                runner,
+                repo,
+                "merge",
+                "--abort",
+                description=f"abort failed merge into {branch}",
+            )
+            assert_checkout()
+            _require_branch(runner, repo, branch)
+            _require_clean(runner, repo)
+        except BaseException as cleanup_error:
+            merge_error.add_note(
+                "merge abort/restoration also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+            raise merge_error from cleanup_error
+        raise
     assert_checkout()
     _require_branch(runner, repo, branch)
     _require_clean(runner, repo)

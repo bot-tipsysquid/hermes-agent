@@ -61,6 +61,7 @@ class _GitRunner:
         runtime_identity_payload: object = _DEFAULT_JSON_PAYLOAD,
         post_build_mutation: str | None = None,
         restoration_failures: list[BaseException] | None = None,
+        abort_failure: BaseException | None = None,
         hostile_hook: bool = False,
         unsafe_git_config: str | None = None,
     ) -> None:
@@ -84,6 +85,7 @@ class _GitRunner:
         self.runtime_identity_payload = runtime_identity_payload
         self.post_build_mutation = post_build_mutation
         self.restoration_failures = list(restoration_failures or [])
+        self.abort_failure = abort_failure
         self.hostile_hook = hostile_hook
         self.unsafe_git_config = unsafe_git_config
         self.hook_executed = False
@@ -92,6 +94,7 @@ class _GitRunner:
         self.downstream_sha = _INITIAL_DOWNSTREAM
         self.remote_main_sha = "0" * 40
         self.remote_downstream_sha = _INITIAL_DOWNSTREAM
+        self.merge_in_progress = False
         self.commands: list[tuple[str, ...]] = []
         self.raw_commands: list[tuple[str, ...]] = []
         self.events: list[object] = []
@@ -134,7 +137,13 @@ class _GitRunner:
                 self._interrupt("branch-probe")
                 return _result(stdout=f"{self.branch}\n")
             if args == ("status", "--porcelain", "--untracked-files=all"):
-                return _result(stdout=" M tracked.py\n" if self.dirty else "")
+                return _result(
+                    stdout="UU shared.txt\n"
+                    if self.merge_in_progress
+                    else " M tracked.py\n"
+                    if self.dirty
+                    else ""
+                )
             if args[:2] == ("remote", "get-url"):
                 remote = args[-1]
                 if remote == "upstream":
@@ -169,9 +178,17 @@ class _GitRunner:
                 self.main_sha = _UPSTREAM_SHA
                 return _result()
             if args == ("merge", "--no-edit", "main"):
+                self.merge_in_progress = True
+                self._interrupt("merge-downstream-after-start")
                 if self.merge_conflict:
                     return _result(1, stderr="CONFLICT")
+                self.merge_in_progress = False
                 self.downstream_sha = _UPDATED_DOWNSTREAM
+                return _result()
+            if args == ("merge", "--abort"):
+                if self.abort_failure is not None:
+                    raise self.abort_failure
+                self.merge_in_progress = False
                 return _result()
             if args[:1] == ("rev-parse",):
                 ref = args[1]
@@ -785,17 +802,66 @@ def test_fast_forward_failure_restores_downstream_and_stops_before_dependencies(
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
 
-def test_merge_conflict_is_left_visible_and_blocks_build_push_and_restart(tmp_path):
+class _FatalInterrupt(BaseException):
+    pass
+
+
+def test_merge_conflict_is_aborted_and_restores_clean_downstream(tmp_path):
     runner = _GitRunner(tmp_path, merge_conflict=True)
 
     with pytest.raises(DownstreamUpdateError, match="merge main into ken/downstream"):
         _run(runner)
 
-    flattened = [part for command in runner.commands for part in command]
-    assert "--abort" not in flattened
-    assert "reset" not in flattened
+    assert runner.commands.count(("git", "merge", "--abort")) == 1
+    assert runner.branch == "ken/downstream"
+    assert not runner.merge_in_progress
+    assert not runner.dirty
+    assert not any(command[1:2] == ("reset",) for command in runner.commands)
     assert not _ran_uv_sync(runner)
     assert _pushed_branch(runner, "main")
+    assert not _pushed_branch(runner, "ken/downstream")
+    assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit, _FatalInterrupt])
+def test_downstream_merge_interruption_aborts_before_reraising_primary_failure(
+    tmp_path, interrupt_type
+):
+    runner = _GitRunner(
+        tmp_path,
+        interrupt_at="merge-downstream-after-start",
+        interrupt_type=interrupt_type,
+    )
+
+    with pytest.raises(interrupt_type, match="merge-downstream-after-start"):
+        _run(runner)
+
+    assert runner.commands.count(("git", "merge", "--abort")) == 1
+    assert runner.branch == "ken/downstream"
+    assert not runner.merge_in_progress
+    assert not _ran_uv_sync(runner)
+    assert not _pushed_branch(runner, "ken/downstream")
+    assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
+
+
+def test_merge_abort_failure_keeps_merge_error_primary_and_reports_both(tmp_path):
+    abort_failure = RuntimeError("merge abort also failed")
+    runner = _GitRunner(
+        tmp_path,
+        merge_conflict=True,
+        abort_failure=abort_failure,
+    )
+
+    with pytest.raises(
+        DownstreamUpdateError, match="merge main into ken/downstream"
+    ) as excinfo:
+        _run(runner)
+
+    assert excinfo.value.__cause__ is abort_failure
+    notes = "\n".join(getattr(excinfo.value, "__notes__", []))
+    assert "merge abort also failed" in notes
+    assert runner.commands.count(("git", "merge", "--abort")) == 1
+    assert not _ran_uv_sync(runner)
     assert not _pushed_branch(runner, "ken/downstream")
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
 
@@ -1036,10 +1102,6 @@ def test_pristine_main_rejects_local_ahead_divergence_or_readback_mismatch(
     assert not _ran_uv_sync(runner)
     assert not any(command[-2:] == ("gateway", "restart") for command in runner.commands)
     assert runner.branch == "ken/downstream"
-
-
-class _FatalInterrupt(BaseException):
-    pass
 
 
 @pytest.mark.parametrize(
@@ -1294,7 +1356,9 @@ def _real_git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _real_git_fixture(tmp_path: Path, *, conflict: bool) -> tuple[Path, UpdateConfig, str]:
+def _real_git_fixture(
+    tmp_path: Path, *, conflict: bool
+) -> tuple[Path, UpdateConfig, str, str]:
     upstream = tmp_path / "upstream.git"
     fork = tmp_path / "fork.git"
     seed = tmp_path / "seed"
@@ -1338,11 +1402,13 @@ def _real_git_fixture(tmp_path: Path, *, conflict: bool) -> tuple[Path, UpdateCo
     _real_git(seed, "push", "upstream", "main")
     config = UpdateConfig(repo=checkout, expected_repo=checkout)
     assert original_downstream
-    return checkout, config, upstream_sha
+    return checkout, config, upstream_sha, original_downstream
 
 
 def test_real_git_pristine_main_publish_and_downstream_merge(tmp_path):
-    checkout, config, upstream_sha = _real_git_fixture(tmp_path, conflict=False)
+    checkout, config, upstream_sha, _original_downstream = _real_git_fixture(
+        tmp_path, conflict=False
+    )
 
     updater._sync_source(updater.SubprocessRunner(), config)
 
@@ -1353,14 +1419,17 @@ def test_real_git_pristine_main_publish_and_downstream_merge(tmp_path):
     assert _real_git(checkout, "status", "--porcelain") == ""
 
 
-def test_real_git_conflict_stays_on_downstream_with_recovery_state_visible(tmp_path):
-    checkout, config, _upstream_sha = _real_git_fixture(tmp_path, conflict=True)
+def test_real_git_conflict_is_aborted_and_restores_clean_downstream(tmp_path):
+    checkout, config, _upstream_sha, original_downstream = _real_git_fixture(
+        tmp_path, conflict=True
+    )
 
     with pytest.raises(DownstreamUpdateError, match="merge main into ken/downstream"):
         updater._sync_source(updater.SubprocessRunner(), config)
 
     assert _real_git(checkout, "branch", "--show-current") == "ken/downstream"
-    assert "UU shared.txt" in _real_git(checkout, "status", "--porcelain")
+    assert _real_git(checkout, "rev-parse", "HEAD") == original_downstream
+    assert _real_git(checkout, "status", "--porcelain") == ""
 
 
 def test_supported_config_migrate_then_strict_validate_command_sequence(tmp_path):
