@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import importlib
 import json
 import os
 from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -617,6 +619,40 @@ def test_python_sync_uses_repo_pin_instead_of_the_launching_venv(tmp_path):
         "--python",
         "3.14",
     ) in runner.commands
+
+
+def test_transaction_pins_validated_checkout_for_late_source_imports(
+    tmp_path, monkeypatch
+):
+    repo = updater.checkout_root().resolve()
+    runner = _GitRunner(repo)
+    old_site_packages = tmp_path / "old-venv" / "site-packages"
+    old_site_packages.mkdir(parents=True)
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [
+            str(old_site_packages),
+            *(
+                entry
+                for entry in sys.path
+                if Path(entry or os.getcwd()).resolve() != repo
+            ),
+        ],
+    )
+    monkeypatch.delitem(sys.modules, "pm", raising=False)
+    assert str(repo) not in sys.path
+
+    def verify_late_source_import(_runner, callback_repo):
+        imported = importlib.import_module("pm")
+
+        assert callback_repo == repo
+        assert imported.__file__ is not None
+        assert Path(imported.__file__).resolve().parent == repo / "pm"
+        assert sys.path[0] == str(repo)
+        assert sys.path.count(str(repo)) == 1
+
+    _run(runner, verify_artifacts=verify_late_source_import)
 
 
 def test_missing_python_pin_stops_before_dependency_sync(tmp_path):

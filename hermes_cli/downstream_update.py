@@ -1148,6 +1148,11 @@ def run_update(
             repo=checkout_identity.path,
             expected_repo=checkout_identity.path,
         )
+        # uv may replace the editable venv backing this still-running process.
+        # Keep later source imports anchored to the checkout already validated above.
+        checkout_import_path = str(checkout_identity.path)
+        sys.path[:] = [entry for entry in sys.path if entry != checkout_import_path]
+        sys.path.insert(0, checkout_import_path)
         container = _gate(
             "Silverblue host and persistent Toolbx preflight",
             lambda: host_preflight(
