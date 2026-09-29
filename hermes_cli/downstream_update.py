@@ -724,6 +724,19 @@ def _verify_config(runner: CommandRunner, config: UpdateConfig) -> None:
         )
 
 
+def _project_python_request(repo: Path) -> str:
+    pin_path = repo / ".python-version"
+    try:
+        request = pin_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as exc:
+        raise DownstreamUpdateError(f"Python version pin is missing: {pin_path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise DownstreamUpdateError(f"Python version pin cannot be read: {pin_path}: {exc}") from exc
+    if not request or any(character.isspace() for character in request):
+        raise DownstreamUpdateError(f"Python version pin is invalid: {pin_path}")
+    return request
+
+
 def _verify_runtime_identity(
     runner: CommandRunner,
     config: UpdateConfig,
@@ -925,12 +938,23 @@ def _run_update_transaction(
     intended_sha = _stdout(
         _git(command_runner, repo, "rev-parse", "HEAD", description="pin downstream revision")
     )
+    python_request = _project_python_request(repo)
 
     output("→ Synchronizing locked Python dependencies with runtime extras and dev group")
     assert_checkout()
     _run(
         command_runner,
-        [config.uv_executable, "sync", "--locked", "--extra", "all", "--group", "dev"],
+        [
+            config.uv_executable,
+            "sync",
+            "--locked",
+            "--extra",
+            "all",
+            "--group",
+            "dev",
+            "--python",
+            python_request,
+        ],
         repo=repo,
         description="locked Python dependency synchronization",
         capture_output=False,
@@ -1169,7 +1193,7 @@ def _dry_run_plan() -> tuple[str, ...]:
         "fetch upstream/main plus fork/main and fork/ken/downstream",
         "fast-forward main, prove equality, publish and read back pristine fork/main",
         "restore ken/downstream in a finally-safe path and merge main",
-        "uv sync --locked --extra all --extra dev",
+        "uv sync --locked --extra all --group dev with the repository .python-version pin",
         "npm ci, focused tests, Web/Desktop typechecks, Web UI build",
         "ARM64 Desktop build through shared Toolbx-aware path",
         "recheck clean branch and intended SHA, then verify Desktop build stamp, bounded ARM64 ELF app, and node-pty",

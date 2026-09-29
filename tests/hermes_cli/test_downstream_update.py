@@ -66,6 +66,7 @@ class _GitRunner:
         unsafe_git_config: str | None = None,
     ) -> None:
         self.repo = repo.resolve()
+        (self.repo / ".python-version").write_text("3.14\n", encoding="utf-8")
         self.branch = branch
         self.dirty = dirty
         self.fail_ff = fail_ff
@@ -533,7 +534,10 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
     checkout_downstream = _index(runner.commands, ("git", "checkout", "ken/downstream"))
     python_sync = _index(
         runner.commands,
-        ("uv", "sync", "--locked", "--extra", "all", "--group", "dev"),
+        (
+            "uv", "sync", "--locked", "--extra", "all", "--group", "dev",
+            "--python", "3.14",
+        ),
     )
     test_run = next(
         i for i, command in enumerate(runner.commands) if command[0].endswith("run_tests.sh")
@@ -597,6 +601,45 @@ def test_happy_path_publishes_pristine_main_restores_downstream_then_tests_build
     )
 
 
+def test_python_sync_uses_repo_pin_instead_of_the_launching_venv(tmp_path):
+    runner = _GitRunner(tmp_path)
+
+    _run(runner)
+
+    assert (
+        "uv",
+        "sync",
+        "--locked",
+        "--extra",
+        "all",
+        "--group",
+        "dev",
+        "--python",
+        "3.14",
+    ) in runner.commands
+
+
+def test_missing_python_pin_stops_before_dependency_sync(tmp_path):
+    runner = _GitRunner(tmp_path)
+    (tmp_path / ".python-version").unlink()
+
+    with pytest.raises(DownstreamUpdateError, match="Python version pin is missing"):
+        _run(runner)
+
+    assert not _ran_uv_sync(runner)
+
+
+@pytest.mark.parametrize("pin", ["", "3.14\n3.13\n", "3.14 candidate\n"])
+def test_invalid_python_pin_stops_before_dependency_sync(tmp_path, pin):
+    runner = _GitRunner(tmp_path)
+    (tmp_path / ".python-version").write_text(pin, encoding="utf-8")
+
+    with pytest.raises(DownstreamUpdateError, match="Python version pin is invalid"):
+        _run(runner)
+
+    assert not _ran_uv_sync(runner)
+
+
 def test_happy_path_orders_every_externally_significant_gate(tmp_path):
     runner = _GitRunner(tmp_path)
 
@@ -644,7 +687,10 @@ def test_happy_path_orders_every_externally_significant_gate(tmp_path):
         ),
         position(("git", "checkout", "ken/downstream")),
         position(("git", "merge", "--no-edit", "main")),
-        position(("uv", "sync", "--locked", "--extra", "all", "--group", "dev")),
+        position((
+            "uv", "sync", "--locked", "--extra", "all", "--group", "dev",
+            "--python", "3.14",
+        )),
         position(
             (
                 "toolbox",
@@ -1313,7 +1359,10 @@ def test_locked_all_extra_and_dev_group_are_selected_before_focused_tests(tmp_pa
 
     sync = _index(
         runner.commands,
-        ("uv", "sync", "--locked", "--extra", "all", "--group", "dev"),
+        (
+            "uv", "sync", "--locked", "--extra", "all", "--group", "dev",
+            "--python", "3.14",
+        ),
     )
     focused = next(
         i for i, command in enumerate(runner.commands) if command[0].endswith("run_tests.sh")
