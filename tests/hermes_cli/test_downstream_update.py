@@ -401,6 +401,31 @@ class _DiskFreeSequence:
         return value
 
 
+def test_real_disk_free_bytes_uses_exact_canonical_path_and_unprivileged_free(
+    tmp_path, monkeypatch
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    canonical_checkout = checkout.resolve(strict=True)
+    real_disk_usage = shutil.disk_usage
+    calls = []
+    observed = []
+
+    def recording_disk_usage(path):
+        calls.append(path)
+        usage = real_disk_usage(path)
+        observed.append(usage)
+        return usage
+
+    monkeypatch.setattr(updater.shutil, "disk_usage", recording_disk_usage)
+
+    available = updater._disk_free_bytes(canonical_checkout)
+
+    assert calls == [canonical_checkout]
+    assert len(observed) == 1
+    assert available == observed[0].free
+
+
 @pytest.mark.parametrize(
     ("values", "stage", "available", "required", "target"),
     [
