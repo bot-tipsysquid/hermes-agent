@@ -33,6 +33,15 @@ _UPSTREAM_SHA = "a" * 40
 _PRE_RESTART_GATEWAY = object()
 _RESTART_THRESHOLD = 1234.5
 _DEFAULT_JSON_PAYLOAD = object()
+_GIB = 1024**3
+_NPM_CI_REQUIRED_BYTES = 4 * _GIB
+_DESKTOP_REQUIRED_BYTES = 6 * _GIB
+_HEADROOM_GUIDANCE = (
+    "Inspect filesystem usage with df and directory sizes with du, then reclaim only "
+    "verified regenerable build outputs or caches. Preserve user data, backups, "
+    "container volumes, credentials, and durable state; the updater performs no "
+    "automatic cleanup."
+)
 
 
 def _result(returncode=0, stdout="", stderr=""):
@@ -354,6 +363,7 @@ def _run(runner: _GitRunner, **overrides):
         "capture_gateway_receipt": capture_gateway_receipt,
         "restart_clock": restart_clock,
         "source_completion_clearer": source_completion_clearer,
+        "disk_free_bytes": lambda _path: _DESKTOP_REQUIRED_BYTES,
         "output": lambda _line: None,
     }
     kwargs.update(overrides)
@@ -373,6 +383,164 @@ def _pushed_branch(runner: _GitRunner, branch: str) -> bool:
     return any(
         command[1:2] == ("push",) and command[-1].endswith(suffix)
         for command in runner.commands
+    )
+
+
+class _DiskFreeSequence:
+    def __init__(self, runner: _GitRunner, values: list[int | BaseException]) -> None:
+        self._runner = runner
+        self._values = iter(values)
+        self.calls: list[Path] = []
+
+    def __call__(self, path: Path) -> int:
+        self.calls.append(path)
+        value = next(self._values)
+        self._runner.events.append(("disk-headroom", value))
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+def test_real_disk_free_bytes_uses_exact_canonical_path_and_unprivileged_free(
+    tmp_path, monkeypatch
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    canonical_checkout = checkout.resolve(strict=True)
+    real_disk_usage = shutil.disk_usage
+    calls = []
+    observed = []
+
+    def recording_disk_usage(path):
+        calls.append(path)
+        usage = real_disk_usage(path)
+        observed.append(usage)
+        return usage
+
+    monkeypatch.setattr(updater.shutil, "disk_usage", recording_disk_usage)
+
+    available = updater._disk_free_bytes(canonical_checkout)
+
+    assert calls == [canonical_checkout]
+    assert len(observed) == 1
+    assert available == observed[0].free
+
+
+@pytest.mark.parametrize(
+    ("values", "stage", "available", "required", "target"),
+    [
+        (
+            [_DESKTOP_REQUIRED_BYTES - 1],
+            "initial update preflight",
+            _DESKTOP_REQUIRED_BYTES - 1,
+            _DESKTOP_REQUIRED_BYTES,
+            "early",
+        ),
+        (
+            [_DESKTOP_REQUIRED_BYTES, _NPM_CI_REQUIRED_BYTES - 1],
+            "locked Node dependency synchronization",
+            _NPM_CI_REQUIRED_BYTES - 1,
+            _NPM_CI_REQUIRED_BYTES,
+            "npm",
+        ),
+        (
+            [
+                _DESKTOP_REQUIRED_BYTES,
+                _NPM_CI_REQUIRED_BYTES,
+                _DESKTOP_REQUIRED_BYTES - 1,
+            ],
+            "ARM64 Desktop packaging",
+            _DESKTOP_REQUIRED_BYTES - 1,
+            _DESKTOP_REQUIRED_BYTES,
+            "desktop",
+        ),
+    ],
+)
+def test_disk_headroom_low_space_is_stage_specific_and_stops_before_target(
+    tmp_path, values, stage, available, required, target
+):
+    runner = _GitRunner(tmp_path)
+    probe = _DiskFreeSequence(runner, values)
+
+    with pytest.raises(DownstreamUpdateError) as excinfo:
+        _run(runner, disk_free_bytes=probe)
+
+    assert str(excinfo.value) == (
+        f"insufficient disk headroom: stage={stage}; path={tmp_path}; "
+        f"available_bytes={available}; required_bytes={required}. "
+        f"{_HEADROOM_GUIDANCE}"
+    )
+    assert probe.calls == [tmp_path] * len(values)
+    npm_ci = ("npm", "ci", "--include=dev")
+    desktop_build = ("python", "-m", "hermes_cli.main", "desktop")
+    if target == "early":
+        assert "host-ready" not in runner.events
+        assert "toolbox-ready" not in runner.events
+        assert not any(
+            command[1:2] in {("fetch",), ("push",)} for command in runner.commands
+        )
+        assert not _ran_uv_sync(runner)
+    if target in {"early", "npm"}:
+        assert not any(command[-3:] == npm_ci for command in runner.commands)
+    if target in {"early", "npm", "desktop"}:
+        assert not any(command[:4] == desktop_build for command in runner.commands)
+    assert not _pushed_branch(runner, "ken/downstream")
+    assert not any(
+        command[-2:] == ("gateway", "restart") for command in runner.commands
+    )
+
+
+def test_disk_headroom_boundaries_reprobe_each_stage_and_probe_errors_fail_closed(
+    tmp_path,
+):
+    runner = _GitRunner(tmp_path)
+    probe = _DiskFreeSequence(
+        runner,
+        [
+            _DESKTOP_REQUIRED_BYTES,
+            _NPM_CI_REQUIRED_BYTES,
+            _DESKTOP_REQUIRED_BYTES,
+        ],
+    )
+
+    assert _run(runner, disk_free_bytes=probe) == _UPDATED_DOWNSTREAM
+    assert probe.calls == [tmp_path, tmp_path, tmp_path]
+
+    npm_command = next(
+        command
+        for command in runner.events
+        if isinstance(command, tuple) and command[-3:] == ("npm", "ci", "--include=dev")
+    )
+    desktop_command = next(
+        command
+        for command in runner.events
+        if isinstance(command, tuple)
+        and command[:4] == ("python", "-m", "hermes_cli.main", "desktop")
+    )
+    probe_positions = [
+        index
+        for index, event in enumerate(runner.events)
+        if isinstance(event, tuple) and event[:1] == ("disk-headroom",)
+    ]
+    assert probe_positions[0] < runner.events.index("host-ready")
+    assert probe_positions[1] + 1 == runner.events.index(npm_command)
+    assert probe_positions[2] + 1 == runner.events.index(desktop_command)
+
+    failed_runner = _GitRunner(tmp_path)
+    failed_probe = _DiskFreeSequence(
+        failed_runner,
+        [OSError("free-space probe unavailable")],
+    )
+    with pytest.raises(DownstreamUpdateError) as excinfo:
+        _run(failed_runner, disk_free_bytes=failed_probe)
+    assert str(excinfo.value) == (
+        "disk headroom probe failed: stage=initial update preflight; "
+        f"path={tmp_path}; required_bytes={_DESKTOP_REQUIRED_BYTES}; "
+        "error=free-space probe unavailable"
+    )
+    assert "host-ready" not in failed_runner.events
+    assert not any(
+        command[1:2] in {("fetch",), ("push",)} for command in failed_runner.commands
     )
 
 
@@ -1721,22 +1889,49 @@ def test_runtime_identity_cli_reports_current_checkout_revision(capsys):
     assert payload["version"]
 
 
-def test_dry_run_prints_plan_without_touching_checkout(capsys):
+def test_dry_run_prints_plan_without_touching_checkout(capsys, monkeypatch):
+    monkeypatch.setattr(
+        updater.shutil,
+        "disk_usage",
+        lambda _path: pytest.fail("dry-run must not probe filesystem capacity"),
+    )
+    monkeypatch.setattr(
+        updater,
+        "run_update",
+        lambda *_args, **_kwargs: pytest.fail("dry-run must not start the transaction"),
+    )
+
     assert main(["--dry-run"]) == 0
 
     output = capsys.readouterr().out
     assert "DRY RUN" in output
     assert "ken/downstream" in output
     assert "gateway restart" in output
-    numbered_steps = [line for line in output.splitlines() if line[:2].strip().isdigit()]
-    assert len(numbered_steps) == 14
+    numbered_steps = [
+        line for line in output.splitlines() if line[:2].strip().isdigit()
+    ]
+    assert len(numbered_steps) == 16
     checkout_validation = next(
-        index for index, line in enumerate(numbered_steps) if "validate clean expected" in line
+        index
+        for index, line in enumerate(numbered_steps)
+        if "validate clean expected" in line
+    )
+    early_headroom = next(
+        index for index, line in enumerate(numbered_steps) if "early 6 GiB" in line
     )
     host_preflight = next(
-        index for index, line in enumerate(numbered_steps) if "native Fedora Silverblue" in line
+        index
+        for index, line in enumerate(numbered_steps)
+        if "native Fedora Silverblue" in line
     )
-    assert checkout_validation < host_preflight
-    assert "recheck clean branch and intended SHA, then verify" in numbered_steps[9]
-    assert "strictly validate config" in numbered_steps[11]
-    assert "capture pre-restart" in numbered_steps[13]
+    npm_headroom = next(
+        index for index, line in enumerate(numbered_steps) if "refresh 4 GiB" in line
+    )
+    desktop_headroom = next(
+        index for index, line in enumerate(numbered_steps) if "refresh 6 GiB" in line
+    )
+    assert checkout_validation < early_headroom < host_preflight
+    assert npm_headroom < desktop_headroom
+    assert "recheck clean branch and intended SHA, then verify" in numbered_steps[11]
+    assert "strictly validate config" in numbered_steps[13]
+    assert "capture pre-restart" in numbered_steps[15]
