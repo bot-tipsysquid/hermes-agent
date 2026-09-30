@@ -38,6 +38,20 @@ _UPSTREAM_SLUG = "NousResearch/hermes-agent"
 _FORK_SLUG = "bot-tipsysquid/hermes-agent"
 _ONECLI_HOST = "127.0.0.1"
 _ONECLI_PORT = 10254
+_GIB = 1024**3
+# Conservative policy bounds, not measurements of historical peak usage.
+_NPM_CI_MIN_FREE_BYTES = 4 * _GIB
+_DESKTOP_BUILD_MIN_FREE_BYTES = 6 * _GIB
+_INITIAL_MIN_FREE_BYTES = max(
+    _NPM_CI_MIN_FREE_BYTES,
+    _DESKTOP_BUILD_MIN_FREE_BYTES,
+)
+_DISK_HEADROOM_GUIDANCE = (
+    "Inspect filesystem usage with df and directory sizes with du, then reclaim only "
+    "verified regenerable build outputs or caches. Preserve user data, backups, "
+    "container volumes, credentials, and durable state; the updater performs no "
+    "automatic cleanup."
+)
 
 
 class DownstreamUpdateError(RuntimeError):
@@ -84,6 +98,7 @@ RuntimeIdentityVerifier = Callable[[CommandRunner, UpdateConfig, str], None]
 OneCLIServiceReady = Callable[[UpdateConfig], bool]
 ExecutableResolver = Callable[[str], str | None]
 SourceCompletionClearer = Callable[[Path], None]
+DiskFreeBytes = Callable[[Path], int]
 
 
 _GIT_REDIRECT_ENVIRONMENT = {
@@ -748,6 +763,45 @@ def _project_python_request(repo: Path) -> str:
     return request
 
 
+def _disk_free_bytes(path: Path) -> int:
+    """Return bytes available to the unprivileged updater on ``path``'s filesystem."""
+    return shutil.disk_usage(path).free
+
+
+def _require_disk_headroom(
+    path: Path,
+    *,
+    stage: str,
+    required_bytes: int,
+    disk_free_bytes: DiskFreeBytes,
+) -> int:
+    """Fail closed unless the canonical checkout filesystem meets a policy bound."""
+    try:
+        available_bytes = disk_free_bytes(path)
+    except Exception as exc:
+        raise DownstreamUpdateError(
+            f"disk headroom probe failed: stage={stage}; path={path}; "
+            f"required_bytes={required_bytes}; error={exc}"
+        ) from exc
+    if (
+        isinstance(available_bytes, bool)
+        or not isinstance(available_bytes, int)
+        or available_bytes < 0
+    ):
+        raise DownstreamUpdateError(
+            f"disk headroom probe failed: stage={stage}; path={path}; "
+            f"required_bytes={required_bytes}; error=invalid available byte value "
+            f"{available_bytes!r}"
+        )
+    if available_bytes < required_bytes:
+        raise DownstreamUpdateError(
+            f"insufficient disk headroom: stage={stage}; path={path}; "
+            f"available_bytes={available_bytes}; required_bytes={required_bytes}. "
+            f"{_DISK_HEADROOM_GUIDANCE}"
+        )
+    return available_bytes
+
+
 def _verify_runtime_identity(
     runner: CommandRunner,
     config: UpdateConfig,
@@ -929,6 +983,7 @@ def _run_update_transaction(
     verify_runtime_identity: RuntimeIdentityVerifier,
     onecli_service_ready: OneCLIServiceReady,
     source_completion_clearer: SourceCompletionClearer,
+    disk_free_bytes: DiskFreeBytes,
     output: Callable[[str], None],
 ) -> str:
     """Run one validated, locked, and host-preflighted downstream transaction."""
@@ -976,6 +1031,12 @@ def _run_update_transaction(
 
     output("→ Synchronizing locked Node dependencies in Toolbx")
     assert_checkout()
+    _require_disk_headroom(
+        repo,
+        stage="locked Node dependency synchronization",
+        required_bytes=_NPM_CI_MIN_FREE_BYTES,
+        disk_free_bytes=disk_free_bytes,
+    )
     _run(
         command_runner,
         [*npm, "ci", "--include=dev"],
@@ -1022,6 +1083,12 @@ def _run_update_transaction(
 
     output("→ Building ARM64 Desktop through the shared Toolbx-aware path")
     assert_checkout()
+    _require_disk_headroom(
+        repo,
+        stage="ARM64 Desktop packaging",
+        required_bytes=_DESKTOP_BUILD_MIN_FREE_BYTES,
+        disk_free_bytes=disk_free_bytes,
+    )
     _run(
         command_runner,
         [
@@ -1144,6 +1211,7 @@ def run_update(
     verify_runtime_identity: RuntimeIdentityVerifier = _verify_runtime_identity,
     onecli_service_ready: OneCLIServiceReady = _onecli_local_service_ready,
     source_completion_clearer: SourceCompletionClearer = _default_source_completion_clearer,
+    disk_free_bytes: DiskFreeBytes = _disk_free_bytes,
     resolve_git_executable: ExecutableResolver = shutil.which,
     output: Callable[[str], None] = print,
 ) -> str:
@@ -1167,6 +1235,12 @@ def run_update(
             fork_fetch_url,
             fork_push_url,
         ) = _validate_checkout(command_runner, config)
+        _require_disk_headroom(
+            checkout_identity.path,
+            stage="initial update preflight",
+            required_bytes=_INITIAL_MIN_FREE_BYTES,
+            disk_free_bytes=disk_free_bytes,
+        )
         validated_config = replace(
             config,
             repo=checkout_identity.path,
@@ -1203,6 +1277,7 @@ def run_update(
             verify_runtime_identity=verify_runtime_identity,
             onecli_service_ready=onecli_service_ready,
             source_completion_clearer=source_completion_clearer,
+            disk_free_bytes=disk_free_bytes,
             output=output,
         )
 
@@ -1219,13 +1294,15 @@ def _dry_run_plan() -> tuple[str, ...]:
     return (
         "acquire owner-only single-writer transaction lock",
         "validate clean expected ken/downstream checkout and canonical GitHub remotes",
+        "apply the early 6 GiB checkout-filesystem headroom policy before host provisioning or source mutation",
         "prove native Fedora Silverblue/OSTree aarch64 and persistent Toolbx readiness",
         "fetch upstream/main plus fork/main and fork/ken/downstream",
         "fast-forward main, prove equality, publish and read back pristine fork/main",
         "restore ken/downstream in a finally-safe path and merge main",
         "uv sync --locked --extra all --group dev with the repository .python-version pin",
-        "npm ci, focused tests, Web/Desktop typechecks, Web UI build",
-        "ARM64 Desktop build through shared Toolbx-aware path",
+        "refresh 4 GiB checkout-filesystem headroom policy, then npm ci",
+        "focused tests, Web/Desktop typechecks, Web UI build",
+        "refresh 6 GiB checkout-filesystem headroom policy, then ARM64 Desktop build through shared Toolbx-aware path",
         "recheck clean branch and intended SHA, then verify Desktop build stamp, bounded ARM64 ELF app, and node-pty",
         "push fork ken/downstream without force and verify SHA",
         "migrate then strictly validate config and verify final CLI runtime revision identity",
