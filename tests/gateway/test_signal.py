@@ -13,7 +13,7 @@ from gateway.config import Platform, PlatformConfig
 def _reset_signal_scheduler():
     """The attachment scheduler is process-wide; drop it between tests
     so a fresh token bucket greets each case."""
-    from gateway.platforms.signal_rate_limit import _reset_scheduler
+    from plugins.platforms.signal.signal_rate_limit import _reset_scheduler
     _reset_scheduler()
     yield
     _reset_scheduler()
@@ -26,7 +26,7 @@ def _reset_signal_scheduler():
 def _make_signal_adapter(monkeypatch, account="+15551234567", **extra):
     """Create a SignalAdapter with sensible test defaults."""
     monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", extra.pop("group_allowed", ""))
-    from gateway.platforms.signal import SignalAdapter
+    from plugins.platforms.signal.adapter import SignalAdapter
     config = PlatformConfig()
     config.enabled = True
     config.extra = {
@@ -91,9 +91,9 @@ class TestSignalConnectCleanup:
         mock_client.get = AsyncMock(return_value=MagicMock(status_code=503))
         mock_client.aclose = AsyncMock()
 
-        with patch("gateway.platforms.signal.httpx.AsyncClient", return_value=mock_client), \
+        with patch("plugins.platforms.signal.adapter.httpx.AsyncClient", return_value=mock_client), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
-             patch("gateway.status.release_scoped_lock") as mock_release:
+             patch("gateway.status_scoped_locks.release_scoped_lock") as mock_release:
             result = await adapter.connect()
 
         assert result is False
@@ -111,7 +111,7 @@ class TestSignalHelpers:
 
 
     def test_parse_comma_list(self):
-        from gateway.platforms.signal import _parse_comma_list
+        from plugins.platforms.signal.adapter import _parse_comma_list
         assert _parse_comma_list("+1234, +5678 , +9012") == ["+1234", "+5678", "+9012"]
         assert _parse_comma_list("") == []
         assert _parse_comma_list("  ,  ,  ") == []
@@ -124,7 +124,7 @@ class TestSignalHelpers:
         ``_guess_extension`` never produced ``.wav`` for raw bytes, so the
         attachment was treated as a document and STT never received it.
         """
-        from gateway.platforms.signal import _is_audio_ext, _guess_extension
+        from plugins.platforms.signal.adapter import _is_audio_ext, _guess_extension
         wav = b"RIFF\x24\x08\x00\x00WAVEfmt " + b"\x00" * 100
         ext = _guess_extension(wav)
         assert ext == ".wav"
@@ -138,7 +138,7 @@ class TestSignalHelpers:
         STT reject the upload ("Invalid file format") even though the bytes
         were valid audio. Audio brands must resolve to ``.m4a``.
         """
-        from gateway.platforms.signal import _guess_extension, _is_audio_ext
+        from plugins.platforms.signal.adapter import _guess_extension, _is_audio_ext
         for brand in (b"M4A ", b"M4B ", b"m4a "):
             data = b"\x00\x00\x00\x1cftyp" + brand + b"\x00" * 100
             assert _guess_extension(data) == ".m4a", brand
@@ -156,7 +156,7 @@ class TestSignalHelpers:
         import shutil
         import subprocess
         import tempfile
-        from gateway.platforms.signal import _remux_aac_to_m4a
+        from plugins.platforms.signal.adapter import _remux_aac_to_m4a
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -172,6 +172,7 @@ class TestSignalHelpers:
                  "-i", "anullsrc=r=44100:cl=mono", "-t", "0.5",
                  "-c:a", "aac", "-f", "adts", adts_path],
                 capture_output=True, timeout=30,
+                check=False,
             )
             if gen.returncode != 0:
                 import pytest
@@ -199,13 +200,13 @@ class TestSignalHelpers:
 
 
     def test_check_requirements(self, monkeypatch):
-        from gateway.platforms.signal import check_signal_requirements
+        from plugins.platforms.signal.adapter import check_signal_requirements
         monkeypatch.setenv("SIGNAL_HTTP_URL", "http://localhost:8080")
         monkeypatch.setenv("SIGNAL_ACCOUNT", "+15551234567")
         assert check_signal_requirements() is True
 
     def test_render_mentions(self):
-        from gateway.platforms.signal import _render_mentions
+        from plugins.platforms.signal.adapter import _render_mentions
         text = "Hello \uFFFC, how are you?"
         mentions = [{"start": 6, "length": 1, "number": "+15559999999"}]
         result = _render_mentions(text, mentions)
@@ -216,7 +217,7 @@ class TestSignalHelpers:
     def test_validate_signal_config_accepts_platform_values(self, monkeypatch):
         monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
         monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
-        from gateway.platforms.signal import validate_signal_config
+        from plugins.platforms.signal.adapter import validate_signal_config
 
         config = PlatformConfig(
             enabled=True,
@@ -259,7 +260,7 @@ class TestSignalAttachmentFetch:
         adapter._rpc, captured = _stub_rpc({"data": b64_data})
 
         with patch(
-            "gateway.platforms.signal.cache_image_from_bytes_async",
+            "plugins.platforms.signal.adapter.cache_image_from_bytes_async",
             new=AsyncMock(return_value="/tmp/test.png"),
         ):
             await adapter._fetch_attachment("attachment-123")
@@ -439,9 +440,9 @@ class TestSignalSendImageFile:
             return real_rmtree(*args, **kwargs)
 
         monkeypatch.setattr(
-            "gateway.platforms.signal.shutil.copyfile", tracking_copyfile
+            "plugins.platforms.signal.adapter.shutil.copyfile", tracking_copyfile
         )
-        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", tracking_rmtree)
+        monkeypatch.setattr("plugins.platforms.signal.adapter.shutil.rmtree", tracking_rmtree)
         adapter._rpc, _ = _stub_rpc({"timestamp": 1})
 
         result = await adapter.send_image_file(
@@ -466,7 +467,7 @@ class TestSignalSendImageFile:
         image_path = tmp_path / "chart.png"
         image_path.write_bytes(b"\x89PNG" + b"\x00" * 100)
 
-        from gateway.platforms import signal as signal_module
+        from plugins.platforms.signal import adapter as signal_module
 
         real_stage = signal_module._stage_outbound_attachments_sync
         loop = asyncio.get_running_loop()
@@ -483,7 +484,7 @@ class TestSignalSendImageFile:
                 loop.call_soon_threadsafe(stage_finished.set)
 
         monkeypatch.setattr(
-            "gateway.platforms.signal._stage_outbound_attachments_sync",
+            "plugins.platforms.signal.adapter._stage_outbound_attachments_sync",
             blocked_stage,
         )
         send_task = asyncio.create_task(
@@ -544,7 +545,7 @@ class TestSignalSendImageFile:
             rpc_started.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        monkeypatch.setattr("plugins.platforms.signal.adapter.shutil.rmtree", blocked_rmtree)
         adapter._rpc = blocked_rpc
         send_task = asyncio.create_task(
             adapter.send_image_file(
@@ -604,7 +605,7 @@ class TestSignalSendImageFile:
             stage_root = Path(params["attachments"][0]).parents[1]
             return {"timestamp": 24680}
 
-        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        monkeypatch.setattr("plugins.platforms.signal.adapter.shutil.rmtree", blocked_rmtree)
         adapter._rpc = accepted_rpc
         send_task = asyncio.create_task(
             adapter.send_image_file(
@@ -635,7 +636,7 @@ class TestSignalSendImageFile:
         adapter = _make_signal_adapter(monkeypatch)
         adapter._stop_typing_indicator = AsyncMock()
         monkeypatch.setattr(
-            "gateway.platforms.signal.cache_image_from_url",
+            "plugins.platforms.signal.adapter.cache_image_from_url",
             AsyncMock(side_effect=OSError("download failed")),
         )
 
@@ -1172,7 +1173,6 @@ class TestSignalTypingBackoff:
 
         async def _fake_rpc(method, params, rpc_id=None, *, log_failures=True):
             call_count["n"] += 1
-            return None
 
         adapter._rpc = _fake_rpc
 
@@ -1335,7 +1335,7 @@ class TestSignalRpcRateLimit:
         """signal-cli ≥ v0.14.3 surfaces server Retry-After under
         ``error.data.response.results[*].retryAfterSeconds`` — _rpc
         carries that value through SignalRateLimitError.retry_after."""
-        from gateway.platforms.signal_rate_limit import (
+        from plugins.platforms.signal.signal_rate_limit import (
             SignalRateLimitError, SIGNAL_RPC_ERROR_RATELIMIT,
         )
 
@@ -1416,10 +1416,10 @@ def _patch_scheduler_sleep(monkeypatch, capture: list):
             await _real_sleep(0)
 
     monkeypatch.setattr(
-        "gateway.platforms.signal_rate_limit.asyncio.sleep", fake_sleep
+        "plugins.platforms.signal.signal_rate_limit.asyncio.sleep", fake_sleep
     )
     monkeypatch.setattr(
-        "gateway.platforms.signal_rate_limit.time.monotonic", lambda: offset[0]
+        "plugins.platforms.signal.signal_rate_limit.time.monotonic", lambda: offset[0]
     )
 
 
@@ -1518,15 +1518,15 @@ class TestSignalSendMultipleImages:
             return real_copyfile(source, target)
 
         monkeypatch.setattr(
-            "gateway.platforms.signal.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 1
+            "plugins.platforms.signal.adapter.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 1
         )
         monkeypatch.setattr(
-            "gateway.platforms.signal.shutil.copyfile", fail_first_copy
+            "plugins.platforms.signal.adapter.shutil.copyfile", fail_first_copy
         )
         mock_rpc, captured = _stub_rpc_responses([{"timestamp": 2}])
         adapter._rpc = mock_rpc
 
-        with caplog.at_level("ERROR", logger="gateway.platforms.signal"):
+        with caplog.at_level("ERROR", logger="plugins.platforms.signal.adapter"):
             await adapter.send_multiple_images(
                 chat_id="+155****4567", images=images
             )
@@ -1550,12 +1550,12 @@ class TestSignalSendMultipleImages:
             raise OSError("cleanup failed")
 
         monkeypatch.setattr(
-            "gateway.platforms.signal.shutil.rmtree", cleanup_then_fail
+            "plugins.platforms.signal.adapter.shutil.rmtree", cleanup_then_fail
         )
         mock_rpc, captured = _stub_rpc_responses([{"timestamp": 1}])
         adapter._rpc = mock_rpc
 
-        with caplog.at_level("WARNING", logger="gateway.platforms.signal"):
+        with caplog.at_level("WARNING", logger="plugins.platforms.signal.adapter"):
             await adapter.send_multiple_images(
                 chat_id="+155****4567", images=_make_image_files(tmp_path, 1)
             )
@@ -1570,7 +1570,7 @@ class TestSignalSendMultipleImages:
         import shutil
         import threading
 
-        from gateway.platforms.signal_rate_limit import SignalRateLimitError
+        from plugins.platforms.signal.signal_rate_limit import SignalRateLimitError
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
         adapter = _make_signal_adapter(monkeypatch)
@@ -1594,7 +1594,7 @@ class TestSignalSendMultipleImages:
             rpc_calls.append(method)
             raise SignalRateLimitError("rate limited", retry_after=1)
 
-        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        monkeypatch.setattr("plugins.platforms.signal.adapter.shutil.rmtree", blocked_rmtree)
         adapter._rpc = rate_limited_rpc
         send_task = asyncio.create_task(
             adapter.send_multiple_images(
@@ -1620,11 +1620,11 @@ class TestSignalSendMultipleImages:
         import shutil
         import threading
 
-        from gateway.platforms.signal_rate_limit import get_scheduler
+        from plugins.platforms.signal.signal_rate_limit import get_scheduler
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
         monkeypatch.setattr(
-            "gateway.platforms.signal.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 1
+            "plugins.platforms.signal.adapter.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 1
         )
         adapter = _make_signal_adapter(monkeypatch)
         adapter._stop_typing_indicator = AsyncMock()
@@ -1654,7 +1654,7 @@ class TestSignalSendMultipleImages:
             stage_root = Path(params["attachments"][0]).parents[1]
             return {"timestamp": 13579}
 
-        monkeypatch.setattr("gateway.platforms.signal.shutil.rmtree", blocked_rmtree)
+        monkeypatch.setattr("plugins.platforms.signal.adapter.shutil.rmtree", blocked_rmtree)
         adapter._rpc = accepted_rpc
         send_task = asyncio.create_task(
             adapter.send_multiple_images(
@@ -1684,7 +1684,7 @@ class TestSignalSendMultipleImages:
     async def test_post_accept_bookkeeping_failure_does_not_invite_retry(
         self, monkeypatch, tmp_path, caplog
     ):
-        from gateway.platforms.signal_rate_limit import get_scheduler
+        from plugins.platforms.signal.signal_rate_limit import get_scheduler
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
         adapter = _make_signal_adapter(monkeypatch)
@@ -1698,7 +1698,7 @@ class TestSignalSendMultipleImages:
         mock_rpc, captured = _stub_rpc_responses([{"timestamp": 24680}])
         adapter._rpc = mock_rpc
 
-        with caplog.at_level("WARNING", logger="gateway.platforms.signal"):
+        with caplog.at_level("WARNING", logger="plugins.platforms.signal.adapter"):
             result = await adapter.send_multiple_images(
                 chat_id="+155****4567", images=_make_image_files(tmp_path, 1)
             )
@@ -1711,11 +1711,11 @@ class TestSignalSendMultipleImages:
     async def test_post_accept_cancellation_stops_remaining_batches(
         self, monkeypatch, tmp_path
     ):
-        from gateway.platforms.signal_rate_limit import get_scheduler
+        from plugins.platforms.signal.signal_rate_limit import get_scheduler
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
         monkeypatch.setattr(
-            "gateway.platforms.signal.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 1
+            "plugins.platforms.signal.adapter.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 1
         )
         adapter = _make_signal_adapter(monkeypatch)
         adapter._stop_typing_indicator = AsyncMock()
@@ -1753,7 +1753,7 @@ class TestSignalSendMultipleImages:
         """signal-cli < v0.14.3 doesn't surface Retry-After. The
         scheduler keeps its default refill rate (1 token / 4s), so a
         retry of n=3 waits 12s."""
-        from gateway.platforms.signal_rate_limit import (
+        from plugins.platforms.signal.signal_rate_limit import (
             SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER,
             SignalRateLimitError,
         )
@@ -1785,7 +1785,7 @@ class TestSignalRateLimitDetection:
 
 
     def test_extract_retry_after_from_results(self):
-        from gateway.platforms.signal import _extract_retry_after_seconds
+        from plugins.platforms.signal.adapter import _extract_retry_after_seconds
         err = {
             "code": -5,
             "message": "Failed to send message due to rate limiting",
@@ -1806,7 +1806,7 @@ class TestSignalRateLimitDetection:
         """libsignal-net's RetryLaterException leaks through as
         AttachmentInvalidException → UnexpectedErrorException when the
         rate-limit fires inside attachment upload. Detect it by substring."""
-        from gateway.platforms.signal import _is_signal_rate_limit_error
+        from plugins.platforms.signal.adapter import _is_signal_rate_limit_error
         err = {
             "code": -32603,
             "message": (
@@ -1873,7 +1873,7 @@ class TestSignalContentlessEnvelope:
         adapter._rpc, _ = _stub_rpc({"data": b64_data})
 
         with patch(
-            "gateway.platforms.signal.cache_image_from_bytes_async",
+            "plugins.platforms.signal.adapter.cache_image_from_bytes_async",
             new=AsyncMock(return_value="/tmp/img.png"),
         ):
             await adapter._handle_envelope({
@@ -1990,7 +1990,7 @@ class TestRecentSentTimestampRing:
         adapter._recent_sent_ttl_seconds = 100.0
 
         # Drive time.monotonic deterministically.
-        import gateway.platforms.signal as sig_mod
+        import plugins.platforms.signal.adapter as sig_mod
         fake_now = [1000.0]
         monkeypatch.setattr(sig_mod.time, "monotonic", lambda: fake_now[0])
 

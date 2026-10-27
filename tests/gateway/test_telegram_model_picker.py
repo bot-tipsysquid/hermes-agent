@@ -112,7 +112,8 @@ class TestTelegramModelPicker:
         assert "`model_1`" in edit_kwargs["text"]
 
     @pytest.mark.asyncio
-    async def test_provider_drilldown_prioritizes_and_marks_current_model(self, monkeypatch):
+    @pytest.mark.parametrize("plan_label", ["", "Large"])
+    async def test_provider_drilldown_prioritizes_and_marks_current_model(self, monkeypatch, plan_label):
         import plugins.platforms.telegram.adapter as tg
 
         class _RecordingButton:
@@ -134,6 +135,7 @@ class TestTelegramModelPicker:
                     "slug": "openai-codex",
                     "name": "OpenAI Codex",
                     "models": ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"],
+                    "model_labels": {"gpt-5.5": plan_label},
                     "total_models": 3,
                     "is_current": True,
                 }
@@ -162,7 +164,8 @@ class TestTelegramModelPicker:
         ]
         markup = query.edit_message_text.call_args[1]["reply_markup"]
         labels = [button.text for row in markup.inline_keyboard for button in row]
-        assert labels[:3] == ["✓ gpt-5.5", "gpt-5.6-sol", "gpt-5.4"]
+        active_label = "✓ gpt-5.5" + (f" · {plan_label}" if plan_label else "")
+        assert labels[:3] == [active_label, "gpt-5.6-sol", "gpt-5.4"]
 
     @pytest.mark.asyncio
     async def test_provider_drilldown_includes_direct_command_hint_for_paginated_models(self, monkeypatch):

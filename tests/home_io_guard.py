@@ -12,6 +12,19 @@ import sys
 import threading
 
 _CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _pm_generation_dirs(prefixes) -> set[Path]:
+    """The PM generation dir (``<installs>/<key>/{environments,test-environment}/<gen>``) around
+    each prefix that is a generation's ``venv``."""
+    found = set()
+    for prefix in prefixes:
+        venv = Path(prefix).resolve()
+        if venv.name in ("venv", ".venv") and venv.parent.parent.name in ("environments", "test-environment"):
+            found.add(venv.parent)
+    return found
+
+
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
@@ -19,6 +32,12 @@ _INTERPRETER_PREFIXES = tuple({
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the
     # interpreter's installation, not Hermes state.
     Path(p).resolve() for p in sys.path if p and Path(p).name in ("site-packages", "dist-packages")
+} | {
+    # scripts/run_tests.sh runs a PM generation venv (<installs>/<key>/{environments,test-environment}
+    # /<gen>/venv) that sits under the home whenever HOME is the run's fake home. The generation dir
+    # around the venv is that interpreter's installation too: `hermes update` probes
+    # <venv>/../hermes_cli/main.py to find the checkout owning its venv (update_owning_install).
+    *_pm_generation_dirs((sys.prefix, sys.exec_prefix)),
 } | {
     # The default install checks the repo out INSIDE the home (install.sh:
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
@@ -32,6 +51,18 @@ _INTERPRETER_PREFIXES = tuple({
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 _PAYLOAD_MANIFEST_PROBE = _normcase(os.fspath(_CHECKOUT_ROOT.parent / "manifest.json"))
+
+
+def _checkout_update_marker(checkout: Path) -> Path:
+    git_dir = checkout / ".git"
+    if git_dir.is_file():
+        pointer = git_dir.read_text(encoding="utf-8").strip()
+        if pointer.startswith("gitdir: "):
+            git_dir = (checkout / pointer.removeprefix("gitdir: ")).resolve()
+    return git_dir / "hermes-update-pull"
+
+
+_CHECKOUT_UPDATE_MARKER_PROBE = _normcase(os.fspath(_checkout_update_marker(_CHECKOUT_ROOT)))
 
 
 def _within(path: str, prefix: str) -> bool:
@@ -86,7 +117,9 @@ class HomeIOGuard:
             # deciding whether to open it. Permit that non-reading probe when a
             # default install or linked worktree lives under the guarded home; an
             # actual open remains guarded below.
-            if metadata and absolute == _PAYLOAD_MANIFEST_PROBE:
+            # A linked checkout stores its interrupted-update marker in the
+            # parent repo's Git directory, outside the checkout exemption.
+            if metadata and absolute in {_PAYLOAD_MANIFEST_PROBE, _CHECKOUT_UPDATE_MARKER_PROBE}:
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
@@ -94,13 +127,15 @@ class HomeIOGuard:
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
                 return
-            # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``. A developer shell puts
-            # PM's tool store (~/.hermes/tools/...) on PATH; probing an executable there is
-            # command lookup, not reading Hermes state. CI has no such entries.
+            # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``, and command resolution
+            # realpath()s the entry itself (is it a Hermes-managed bin dir?), which lstats each of
+            # its ancestors. A developer shell puts PM's tool store (~/.hermes/tools/...) on PATH;
+            # probing there is command lookup, not reading Hermes state. CI has no such entries.
             if metadata:
                 path = os.environ.get("PATH", "")
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
-                if os.path.dirname(absolute) in self._path_entries(path, cwd):
+                entries = self._path_entries(path, cwd)
+                if os.path.dirname(absolute) in entries or any(_contains(absolute, entry) for entry in entries):
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
@@ -136,7 +171,7 @@ class HomeIOGuard:
         resolved = _normcase(os.path.realpath(absolute))
         for app in apps:
             if _within(absolute, app) or _within(resolved, app):
-                import pytest  # noqa: PLC0415
+                import pytest
                 # pytest.fail, not AssertionError: removal helpers catch Exception and would log
                 # the refusal as a warning while the test passed.
                 pytest.fail(f"TEST BUG: changing the REAL installed Hermes desktop app: {value}\n"
